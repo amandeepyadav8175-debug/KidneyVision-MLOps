@@ -43,6 +43,28 @@ jobs:
           pip install pytest httpx
 
 
+      # --------------------------------------------------------
+      # CREATE CI-ONLY SYNTHETIC DATASET
+      # --------------------------------------------------------
+
+      - name: Create CI test dataset
+        run: |
+          python tests/fixtures/create_ci_dataset.py
+
+
+      # --------------------------------------------------------
+      # GENERATE TRAIN / VALIDATION / TEST MANIFESTS
+      # --------------------------------------------------------
+
+      - name: Prepare CI dataset
+        run: |
+          python src/data/prepare_dataset.py
+
+
+      # --------------------------------------------------------
+      # VERIFY PROJECT STRUCTURE
+      # --------------------------------------------------------
+
       - name: Verify project structure
         run: |
           echo "Current directory:"
@@ -57,9 +79,21 @@ jobs:
           ls -la api
 
           echo ""
+          echo "CI dataset:"
+          ls -la data/raw/images/New\ folder9999
+
+          echo ""
+          echo "Generated manifests:"
+          ls -la data/processed/manifests
+
+          echo ""
           echo "Python version:"
           python --version
 
+
+      # --------------------------------------------------------
+      # RUN TESTS
+      # --------------------------------------------------------
 
       - name: Run test suite
         run: |
