@@ -1,0 +1,91 @@
+# ==============================
+# Python
+# ==============================
+
+.venv/
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==============================
+# IDE / Editor
+# ==============================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==============================
+# Git
+# ==============================
+
+.git/
+
+# ==============================
+# Datasets
+# ==============================
+
+data/raw/
+data/processed/
+
+# ==============================
+# Generated reports
+# ==============================
+
+data/reports/
+
+# ==============================
+# MLflow
+# ==============================
+
+mlruns/
+artifacts/mlflow.db
+
+# ==============================
+# Model checkpoints
+# Large .pt files should NOT go
+# to normal GitHub repository
+# ==============================
+
+artifacts/checkpoints/
+*.pt
+*.pth
+
+# ==============================
+# Generated evaluation artifacts
+# ==============================
+
+artifacts/benchmark/
+artifacts/evaluation/
+artifacts/explainability/
+
+# ==============================
+# Deployment model
+# ==============================
+
+artifacts/deployment_model/
+
+# ==============================
+# Logs
+# ==============================
+
+*.log
+
+# ==============================
+# OS files
+# ==============================
+
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Temporary files
+# ==============================
+
+*.tmp
+*.temp
+*.bak

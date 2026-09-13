@@ -1,0 +1,17 @@
+services:
+  kidneyvision-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: kidneyvision-api:latest
+
+    container_name: kidneyvision-api-container
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      MODEL_SOURCE: local
+
+    restart: unless-stopped

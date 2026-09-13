@@ -1,0 +1,40 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Git / IDE
+.git/
+.github/
+.vscode/
+.ipynb_checkpoints/
+
+# Tests
+tests/
+
+# Raw and processed datasets
+data/raw/
+data/processed/
+data/reports/
+
+# MLflow local tracking data
+mlruns/
+
+# Ignore ALL generated artifacts by default
+artifacts/*
+
+# Keep ONLY the production deployment model
+!artifacts/deployment_model/
+!artifacts/deployment_model/**
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
