@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 
 import requests
 import streamlit as st
@@ -10,8 +11,12 @@ from PIL import Image
 # CONFIGURATION
 # ============================================================
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = os.getenv(
+    "API_URL",
+    "http://127.0.0.1:8000"
+)
 
+PREDICT_ENDPOINT = f"{API_URL}/predict"
 EXPLAIN_ENDPOINT = f"{API_URL}/explain"
 HEALTH_ENDPOINT = f"{API_URL}/health"
 
@@ -115,7 +120,7 @@ with st.sidebar:
 
     st.write("🟢 Normal")
     st.write("🔵 Cyst")
-    st.write("🟠 Stone")
+    st.write("🟡 Stone")
     st.write("🔴 Tumor")
 
     st.markdown("---")
@@ -130,15 +135,11 @@ with st.sidebar:
         )
 
         if health_response.status_code == 200:
-
             st.success("API Online")
-
         else:
-
             st.error("API Error")
 
     except requests.exceptions.RequestException:
-
         st.error("API Offline")
 
     st.markdown("---")
@@ -183,6 +184,7 @@ if uploaded_file is not None:
 
         st.stop()
 
+
     # ========================================================
     # DISPLAY UPLOADED IMAGE
     # ========================================================
@@ -196,7 +198,7 @@ if uploaded_file is not None:
         st.image(
             image,
             caption=uploaded_file.name,
-            use_container_width=True
+            width="stretch"
         )
 
     with col2:
@@ -215,6 +217,7 @@ if uploaded_file is not None:
 
     st.markdown("---")
 
+
     # ========================================================
     # ANALYZE BUTTON
     # ========================================================
@@ -222,7 +225,7 @@ if uploaded_file is not None:
     if st.button(
         "🔍 Analyze Image",
         type="primary",
-        use_container_width=True
+        width="stretch"
     ):
 
         with st.spinner(
@@ -232,7 +235,7 @@ if uploaded_file is not None:
             try:
 
                 # ------------------------------------------------
-                # SEND IMAGE TO FASTAPI
+                # PREPARE IMAGE FILE
                 # ------------------------------------------------
 
                 files = {
@@ -243,29 +246,35 @@ if uploaded_file is not None:
                     )
                 }
 
-                response = requests.post(
-                    EXPLAIN_ENDPOINT,
+
+                # =================================================
+                # STEP 1: PREDICTION
+                # =================================================
+
+                predict_response = requests.post(
+                    PREDICT_ENDPOINT,
                     files=files,
                     timeout=120
                 )
 
+
                 # ------------------------------------------------
-                # HANDLE API ERROR
+                # HANDLE PREDICTION API ERROR
                 # ------------------------------------------------
 
-                if response.status_code != 200:
+                if predict_response.status_code != 200:
 
                     try:
 
-                        error_detail = response.json()
+                        error_detail = predict_response.json()
 
                     except Exception:
 
-                        error_detail = response.text
+                        error_detail = predict_response.text
 
                     st.error(
-                        f"API request failed "
-                        f"(HTTP {response.status_code})"
+                        f"Prediction API request failed "
+                        f"(HTTP {predict_response.status_code})"
                     )
 
                     st.code(
@@ -274,11 +283,12 @@ if uploaded_file is not None:
 
                     st.stop()
 
+
                 # ------------------------------------------------
-                # READ API RESPONSE
+                # READ PREDICTION JSON
                 # ------------------------------------------------
 
-                result = response.json()
+                result = predict_response.json()
 
                 prediction = result.get(
                     "prediction",
@@ -304,15 +314,51 @@ if uploaded_file is not None:
                     {}
                 )
 
-                gradcam_base64 = result.get(
-                    "gradcam_image_base64"
+
+                # =================================================
+                # STEP 2: GRAD-CAM
+                # =================================================
+
+                explain_response = requests.post(
+                    EXPLAIN_ENDPOINT,
+                    files=files,
+                    timeout=120
                 )
 
+
                 # ------------------------------------------------
-                # SAVE RESULT
+                # HANDLE GRAD-CAM RESPONSE
                 # ------------------------------------------------
 
+                if explain_response.status_code == 200:
+
+                    # /explain returns PNG image bytes.
+                    # It does NOT return JSON.
+
+                    gradcam_base64 = base64.b64encode(
+                        explain_response.content
+                    ).decode("utf-8")
+
+                else:
+
+                    gradcam_base64 = None
+
+                    st.warning(
+                        "Prediction succeeded, but "
+                        "Grad-CAM could not be generated."
+                    )
+
+
+                # =================================================
+                # SAVE RESULT
+                # =================================================
+
+                result["gradcam_image_base64"] = (
+                    gradcam_base64
+                )
+
                 st.session_state["result"] = result
+
 
                 # =================================================
                 # PREDICTION RESULT
@@ -323,6 +369,7 @@ if uploaded_file is not None:
                 st.header("Prediction Result")
 
                 result_col1, result_col2 = st.columns(2)
+
 
                 with result_col1:
 
@@ -343,6 +390,7 @@ if uploaded_file is not None:
                         unsafe_allow_html=True
                     )
 
+
                 with result_col2:
 
                     st.markdown(
@@ -361,6 +409,7 @@ if uploaded_file is not None:
                         """,
                         unsafe_allow_html=True
                     )
+
 
                 # =================================================
                 # CLASS PROBABILITIES
@@ -409,6 +458,7 @@ if uploaded_file is not None:
                                 )
                             )
 
+
                 # =================================================
                 # GRAD-CAM
                 # =================================================
@@ -425,6 +475,7 @@ if uploaded_file is not None:
                     contributed to the model's prediction.
                     """
                 )
+
 
                 if gradcam_base64:
 
@@ -443,7 +494,7 @@ if uploaded_file is not None:
                         st.image(
                             gradcam_image,
                             caption="Grad-CAM Explanation",
-                            use_container_width=True
+                            width="stretch"
                         )
 
                     except Exception as error:
@@ -460,6 +511,7 @@ if uploaded_file is not None:
                         "Grad-CAM image was not returned by the API."
                     )
 
+
                 # =================================================
                 # RAW API RESPONSE
                 # =================================================
@@ -469,6 +521,7 @@ if uploaded_file is not None:
                 ):
 
                     st.json(result)
+
 
             # ====================================================
             # REQUEST ERROR HANDLING
@@ -485,23 +538,26 @@ if uploaded_file is not None:
                     """
                 )
 
+
             except requests.exceptions.ConnectionError:
 
                 st.error(
-                    """
+                    f"""
                     Could not connect to FastAPI.
 
-                    Start the backend first:
+                    Current API URL:
 
-                    uvicorn api.main:app --reload
+                    {API_URL}
                     """
                 )
+
 
             except requests.exceptions.RequestException as error:
 
                 st.error(
                     f"Request failed: {error}"
                 )
+
 
             except Exception as error:
 
