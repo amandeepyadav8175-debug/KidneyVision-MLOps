@@ -4,24 +4,37 @@ on:
   push:
     branches:
       - main
+
   pull_request:
     branches:
       - main
 
+
 jobs:
+
+  # ============================================================
+  # TEST JOB
+  # ============================================================
 
   test:
     name: Run Tests
+
     runs-on: ubuntu-latest
 
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
 
       - name: Install dependencies
         run: |
@@ -29,19 +42,47 @@ jobs:
           pip install -r requirements.txt
           pip install pytest httpx
 
+
+      - name: Verify project structure
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo ""
+          echo "Project files:"
+          ls -la
+
+          echo ""
+          echo "API directory:"
+          ls -la api
+
+          echo ""
+          echo "Python version:"
+          python --version
+
+
       - name: Run test suite
         run: |
-          pytest tests/ -v
+          python -m pytest tests/ -v
 
+
+  # ============================================================
+  # DOCKER JOB
+  # ============================================================
 
   docker:
     name: Build Docker Image
+
     runs-on: ubuntu-latest
-    needs: test
+
+    needs:
+      - test
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
 
       - name: Build Docker image
         run: |
