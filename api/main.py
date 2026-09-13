@@ -1,236 +1,150 @@
-from io import BytesIO
-import base64
-
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from PIL import Image, UnidentifiedImageError
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import Response
+from PIL import Image
+import io
 
 from api.inference import (
     predict_image,
     get_model_info,
-    MODEL
+    get_model
 )
 
-from src.explainability.gradcam import (
-    generate_gradcam_for_api
-)
+from src.explainability.gradcam import generate_gradcam_for_api
 
-
-# ============================================================
-# FASTAPI APPLICATION
-# ============================================================
 
 app = FastAPI(
-    title="KidneyVision MLOps API",
-    description=(
-        "Deep Learning API for kidney CT image "
-        "classification using Swin Transformer."
-    ),
+    title="KidneyVision API",
+    description="Kidney CT image classification API",
     version="1.0.0"
 )
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/health")
-def health_check():
-
+@app.get("/")
+def root():
     return {
-        "status": "healthy",
-        "model_loaded": True
+        "message": "KidneyVision API is running",
+        "docs": "/docs"
     }
 
 
-# ============================================================
-# MODEL INFORMATION
-# ============================================================
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
+
 
 @app.get("/model-info")
 def model_info():
+    try:
+        return get_model_info()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not load model information: {str(e)}"
+        )
 
-    return get_model_info()
-
-
-# ============================================================
-# PREDICTION ENDPOINT
-# ============================================================
 
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(...)
-):
-
-    if file.content_type not in [
-        "image/jpeg",
-        "image/png",
-        "image/jpg"
-    ]:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid image format. "
-                "Please upload JPG or PNG."
-            )
-        )
-
+async def predict(file: UploadFile = File(...)):
     try:
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only image files are allowed."
+            )
 
-        file_bytes = await file.read()
+        # Read uploaded image
+        contents = await file.read()
 
-        image = Image.open(
-            BytesIO(file_bytes)
-        )
+        if not contents:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty."
+            )
 
+        # Open image
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+
+        # Run prediction
         result = predict_image(image)
 
-        return {
-            "filename": file.filename,
-            **result
-        }
+        return result
 
-    except UnidentifiedImageError:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is not a valid image."
-        )
+    except HTTPException:
+        raise
 
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
             detail=f"Prediction failed: {str(e)}"
         )
 
 
-# ============================================================
-# GRAD-CAM EXPLAINABILITY ENDPOINT
-# ============================================================
-
 @app.post("/explain")
-async def explain(
-    file: UploadFile = File(...)
-):
-
-    if file.content_type not in [
-        "image/jpeg",
-        "image/png",
-        "image/jpg"
-    ]:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid image format. "
-                "Please upload JPG or PNG."
-            )
-        )
-
+async def explain(file: UploadFile = File(...)):
     try:
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only image files are allowed."
+            )
 
-        # -------------------------------------------------------
-        # Read image
-        # -------------------------------------------------------
+        # Read uploaded image
+        contents = await file.read()
 
-        file_bytes = await file.read()
+        if not contents:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty."
+            )
 
-        image = Image.open(
-            BytesIO(file_bytes)
-        ).convert("RGB")
+        # Open image
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
 
-        # -------------------------------------------------------
-        # First perform normal prediction
-        # -------------------------------------------------------
+        # First get prediction
+        prediction_result = predict_image(image)
 
-        prediction_result = predict_image(
-            image
-        )
+        predicted_class = prediction_result["prediction"]
+        confidence = prediction_result["confidence"]
 
-        predicted_class = (
-            prediction_result["prediction"]
-        )
+        # Get class index from model probabilities
+        probabilities = prediction_result["probabilities"]
 
-        confidence = (
-            prediction_result["confidence"]
-        )
+        class_names = [
+            "Normal",
+            "Cyst",
+            "Stone",
+            "Tumor"
+        ]
 
-        # -------------------------------------------------------
-        # Find predicted class index
-        # -------------------------------------------------------
+        predicted_index = class_names.index(predicted_class)
 
-        from configs.training_config import CLASS_NAMES
-
-        predicted_index = CLASS_NAMES.index(
-            predicted_class
-        )
-
-        # -------------------------------------------------------
         # Generate Grad-CAM
-        # -------------------------------------------------------
-
         gradcam_bytes = generate_gradcam_for_api(
-            model=MODEL,
+            model=get_model(),
             image=image,
             predicted_index=predicted_index,
             predicted_class=predicted_class,
             confidence=confidence
         )
 
-        # -------------------------------------------------------
-        # Convert PNG to Base64
-        # -------------------------------------------------------
-
-        gradcam_base64 = base64.b64encode(
-            gradcam_bytes
-        ).decode("utf-8")
-
-        # -------------------------------------------------------
-        # Response
-        # -------------------------------------------------------
-
-        return {
-            "filename": file.filename,
-            "prediction": predicted_class,
-            "confidence": confidence,
-            "confidence_percent": round(
-                confidence * 100,
-                2
-            ),
-            "probabilities": (
-                prediction_result["probabilities"]
-            ),
-            "gradcam_image_base64": gradcam_base64,
-            "gradcam_media_type": "image/png"
-        }
-
-    except UnidentifiedImageError:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is not a valid image."
+        return Response(
+            content=gradcam_bytes,
+            media_type="image/png",
+            headers={
+                "X-Predicted-Class": predicted_class,
+                "X-Confidence": str(confidence)
+            }
         )
+
+    except HTTPException:
+        raise
 
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
-            detail=f"Explainability failed: {str(e)}"
+            detail=f"Explainability generation failed: {str(e)}"
         )
-
-
-# ============================================================
-# ROOT
-# ============================================================
-
-@app.get("/")
-def root():
-
-    return {
-        "project": "KidneyVision MLOps",
-        "message": (
-            "Kidney CT Classification API is running."
-        ),
-        "docs": "/docs"
-    }

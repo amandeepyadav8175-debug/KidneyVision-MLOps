@@ -51,7 +51,10 @@ IMAGE_SIZE = 224
 # Local development uses MLflow Registry by default.
 # Docker will set MODEL_SOURCE=local.
 
-MODEL_SOURCE = os.getenv("MODEL_SOURCE", "registry").strip().lower()
+MODEL_SOURCE = os.getenv(
+    "MODEL_SOURCE",
+    "registry"
+).strip().lower()
 
 
 # ============================================================
@@ -157,10 +160,20 @@ def load_model():
 
 
 # ============================================================
-# LOAD MODEL ON API STARTUP
+# LAZY MODEL LOADING
 # ============================================================
 
-MODEL = load_model()
+MODEL = None
+
+
+def get_model():
+
+    global MODEL
+
+    if MODEL is None:
+        MODEL = load_model()
+
+    return MODEL
 
 
 # ============================================================
@@ -169,10 +182,16 @@ MODEL = load_model()
 
 def predict_image(image: Image.Image) -> Dict:
 
-    # Convert image to RGB
+    # --------------------------------------------------------
+    # CONVERT IMAGE TO RGB
+    # --------------------------------------------------------
+
     image = image.convert("RGB")
 
-    # Apply validation/test preprocessing
+    # --------------------------------------------------------
+    # APPLY VALIDATION/TEST PREPROCESSING
+    # --------------------------------------------------------
+
     input_tensor = TRANSFORM(image)
 
     # Add batch dimension
@@ -182,12 +201,20 @@ def predict_image(image: Image.Image) -> Dict:
     input_tensor = input_tensor.to(DEVICE)
 
     # --------------------------------------------------------
+    # GET MODEL
+    # --------------------------------------------------------
+
+    # IMPORTANT:
+    # Do NOT use MODEL directly because MODEL is loaded lazily.
+    model = get_model()
+
+    # --------------------------------------------------------
     # MODEL INFERENCE
     # --------------------------------------------------------
 
     with torch.no_grad():
 
-        output = MODEL(input_tensor)
+        output = model(input_tensor)
 
         # Some architectures return an object
         # containing logits.
@@ -195,7 +222,10 @@ def predict_image(image: Image.Image) -> Dict:
             output = output.logits
 
         # Convert logits to probabilities
-        probabilities = F.softmax(output, dim=1)
+        probabilities = F.softmax(
+            output,
+            dim=1
+        )
 
         # Get highest probability
         confidence, predicted_index = torch.max(
@@ -203,7 +233,10 @@ def predict_image(image: Image.Image) -> Dict:
             dim=1
         )
 
-    # Convert tensors to Python values
+    # --------------------------------------------------------
+    # CONVERT TENSORS TO PYTHON VALUES
+    # --------------------------------------------------------
+
     predicted_index = predicted_index.item()
 
     confidence = confidence.item()

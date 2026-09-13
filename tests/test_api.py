@@ -1,16 +1,8 @@
 import io
-import sys
-from pathlib import Path
+import base64
 
 from PIL import Image
 from fastapi.testclient import TestClient
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 
 from api.main import app
 
@@ -18,16 +10,93 @@ from api.main import app
 client = TestClient(app)
 
 
-IMAGE_PATH = (
-    PROJECT_ROOT
-    / "data"
-    / "raw"
-    / "images"
-    / "New folder9999"
-    / "cystfolder"
-    / "Cyst- (70).jpg"
-)
+# ============================================================
+# TEST IMAGE
+# ============================================================
 
+def create_test_image():
+    """
+    Creates a small valid RGB JPEG image in memory.
+    No real dataset image is required for API tests.
+    """
+
+    image = Image.new(
+        "RGB",
+        (64, 64),
+        color=(120, 120, 120)
+    )
+
+    buffer = io.BytesIO()
+
+    image.save(
+        buffer,
+        format="JPEG"
+    )
+
+    buffer.seek(0)
+
+    return buffer
+
+
+# ============================================================
+# MOCK PREDICTION
+# ============================================================
+
+def mock_predict_image(image):
+    """
+    Deterministic fake prediction for testing.
+    """
+
+    return {
+        "prediction": "Cyst",
+        "confidence": 0.998,
+        "confidence_percent": 99.8,
+        "probabilities": {
+            "Normal": 0.001,
+            "Cyst": 0.998,
+            "Stone": 0.0005,
+            "Tumor": 0.0005
+        }
+    }
+
+
+# ============================================================
+# MOCK GRAD-CAM
+# ============================================================
+
+def mock_gradcam(
+    model,
+    image,
+    predicted_index,
+    predicted_class,
+    confidence
+):
+    """
+    Fake Grad-CAM generator used only during tests.
+
+    The function signature MUST match the real
+    generate_gradcam_for_api() function.
+    """
+
+    buffer = io.BytesIO()
+
+    fake_image = Image.new(
+        "RGB",
+        (16, 16),
+        color=(255, 0, 0)
+    )
+
+    fake_image.save(
+        buffer,
+        format="PNG"
+    )
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# ROOT ENDPOINT
+# ============================================================
 
 def test_root_endpoint():
 
@@ -38,7 +107,12 @@ def test_root_endpoint():
     data = response.json()
 
     assert "message" in data
+    assert "docs" in data
 
+
+# ============================================================
+# HEALTH ENDPOINT
+# ============================================================
 
 def test_health_endpoint():
 
@@ -51,7 +125,27 @@ def test_health_endpoint():
     assert data["status"] == "healthy"
 
 
-def test_model_info_endpoint():
+# ============================================================
+# MODEL INFO ENDPOINT
+# ============================================================
+
+def test_model_info_endpoint(monkeypatch):
+
+    fake_model_info = {
+        "model_name": "SwinTransformer",
+        "version": "1",
+        "classes": [
+            "Normal",
+            "Cyst",
+            "Stone",
+            "Tumor"
+        ]
+    }
+
+    monkeypatch.setattr(
+        "api.main.get_model_info",
+        lambda: fake_model_info
+    )
 
     response = client.get("/model-info")
 
@@ -59,133 +153,120 @@ def test_model_info_endpoint():
 
     data = response.json()
 
-    assert data["model"] == "SwinTransformer"
+    assert data["model_name"] == "SwinTransformer"
+    assert data["version"] == "1"
+    assert len(data["classes"]) == 4
 
-    assert data["registered_model"] == (
-        "KidneyVision-SwinTransformer"
+
+# ============================================================
+# PREDICT ENDPOINT
+# ============================================================
+
+def test_predict_endpoint(monkeypatch):
+
+    # Replace real model inference
+    monkeypatch.setattr(
+        "api.main.predict_image",
+        mock_predict_image
     )
 
-    assert data["alias"] == "champion"
+    image_buffer = create_test_image()
 
-    assert data["image_size"] == 224
-
-    assert data["status"] == "loaded"
-
-    assert set(data["classes"]) == {
-        "Normal",
-        "Cyst",
-        "Stone",
-        "Tumor"
-    }
-
-
-def test_predict_endpoint():
-
-    assert IMAGE_PATH.exists()
-
-    with open(IMAGE_PATH, "rb") as image_file:
-
-        response = client.post(
-            "/predict",
-            files={
-                "file": (
-                    "Cyst- (70).jpg",
-                    image_file,
-                    "image/jpeg"
-                )
-            }
-        )
+    response = client.post(
+        "/predict",
+        files={
+            "file": (
+                "test.jpg",
+                image_buffer,
+                "image/jpeg"
+            )
+        }
+    )
 
     assert response.status_code == 200
 
     data = response.json()
 
-    assert "prediction" in data
-
-    assert "confidence" in data
-
-    assert "confidence_percent" in data
+    assert data["prediction"] == "Cyst"
+    assert data["confidence"] == 0.998
+    assert data["confidence_percent"] == 99.8
 
     assert "probabilities" in data
 
-    assert data["prediction"] in {
-        "Normal",
-        "Cyst",
-        "Stone",
-        "Tumor"
-    }
-
-    assert 0.0 <= data["confidence"] <= 1.0
-
-    assert 0.0 <= data["confidence_percent"] <= 100.0
-
-    probabilities = data["probabilities"]
-
-    assert set(probabilities.keys()) == {
-        "Normal",
-        "Cyst",
-        "Stone",
-        "Tumor"
-    }
-
-    for probability in probabilities.values():
-
-        assert 0.0 <= probability <= 1.0
+    assert "Normal" in data["probabilities"]
+    assert "Cyst" in data["probabilities"]
+    assert "Stone" in data["probabilities"]
+    assert "Tumor" in data["probabilities"]
 
 
-def test_explain_endpoint():
+# ============================================================
+# EXPLAIN ENDPOINT
+# ============================================================
 
-    assert IMAGE_PATH.exists()
+def test_explain_endpoint(monkeypatch):
 
-    with open(IMAGE_PATH, "rb") as image_file:
+    # Replace real model inference
+    monkeypatch.setattr(
+        "api.main.predict_image",
+        mock_predict_image
+    )
 
-        response = client.post(
-            "/explain",
-            files={
-                "file": (
-                    "Cyst- (70).jpg",
-                    image_file,
-                    "image/jpeg"
-                )
-            }
-        )
+    # Replace real Grad-CAM generation
+    monkeypatch.setattr(
+        "api.main.generate_gradcam_for_api",
+        mock_gradcam
+    )
+
+    # Prevent loading the real MLflow model
+    monkeypatch.setattr(
+        "api.main.get_model",
+        lambda: object()
+    )
+
+    image_buffer = create_test_image()
+
+    response = client.post(
+        "/explain",
+        files={
+            "file": (
+                "test.jpg",
+                image_buffer,
+                "image/jpeg"
+            )
+        }
+    )
 
     assert response.status_code == 200
 
-    data = response.json()
+    # Grad-CAM endpoint should return PNG
+    assert response.headers["content-type"] == "image/png"
 
-    assert data["filename"] == "Cyst- (70).jpg"
+    # Verify prediction information is returned in headers
+    assert response.headers["x-predicted-class"] == "Cyst"
 
-    assert "prediction" in data
+    assert float(
+        response.headers["x-confidence"]
+    ) == 0.998
 
-    assert "confidence" in data
+    # Verify returned content is not empty
+    assert len(response.content) > 0
 
-    assert "confidence_percent" in data
+    # Verify it is actually a valid PNG
+    result_image = Image.open(
+        io.BytesIO(response.content)
+    )
 
-    assert "probabilities" in data
+    assert result_image.format == "PNG"
 
-    assert "gradcam_image_base64" in data
 
-    assert "gradcam_media_type" in data
-
-    assert data["prediction"] in {
-        "Normal",
-        "Cyst",
-        "Stone",
-        "Tumor"
-    }
-
-    assert 0.0 <= data["confidence"] <= 1.0
-
-    assert data["gradcam_media_type"] == "image/png"
-
-    assert len(data["gradcam_image_base64"]) > 100
-
+# ============================================================
+# INVALID FILE - PREDICT
+# ============================================================
 
 def test_predict_rejects_non_image():
 
-    fake_file = io.BytesIO(
-        b"This is not an image"
+    text_file = io.BytesIO(
+        b"This is not an image."
     )
 
     response = client.post(
@@ -193,19 +274,23 @@ def test_predict_rejects_non_image():
         files={
             "file": (
                 "test.txt",
-                fake_file,
+                text_file,
                 "text/plain"
             )
         }
     )
 
-    assert response.status_code >= 400
+    assert response.status_code == 400
 
+
+# ============================================================
+# INVALID FILE - EXPLAIN
+# ============================================================
 
 def test_explain_rejects_non_image():
 
-    fake_file = io.BytesIO(
-        b"This is not an image"
+    text_file = io.BytesIO(
+        b"This is not an image."
     )
 
     response = client.post(
@@ -213,10 +298,10 @@ def test_explain_rejects_non_image():
         files={
             "file": (
                 "test.txt",
-                fake_file,
+                text_file,
                 "text/plain"
             )
         }
     )
 
-    assert response.status_code >= 400
+    assert response.status_code == 400
