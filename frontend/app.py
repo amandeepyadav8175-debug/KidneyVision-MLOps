@@ -332,9 +332,6 @@ if uploaded_file is not None:
 
                 if explain_response.status_code == 200:
 
-                    # /explain returns PNG image bytes.
-                    # It does NOT return JSON.
-
                     gradcam_base64 = base64.b64encode(
                         explain_response.content
                     ).decode("utf-8")
@@ -371,12 +368,15 @@ if uploaded_file is not None:
                 result_col1, result_col2 = st.columns(2)
 
 
+                # ------------------------------------------------
+                # PREDICTED CLASS
+                # ------------------------------------------------
+
                 with result_col1:
 
-                    st.markdown(
+                    st.html(
                         f"""
                         <div class="prediction-box">
-
                             <div class="prediction-label">
                                 Predicted Class
                             </div>
@@ -384,19 +384,20 @@ if uploaded_file is not None:
                             <div class="prediction-value">
                                 {prediction}
                             </div>
-
                         </div>
-                        """,
-                        unsafe_allow_html=True
+                        """
                     )
 
 
+                # ------------------------------------------------
+                # CONFIDENCE
+                # ------------------------------------------------
+
                 with result_col2:
 
-                    st.markdown(
+                    st.html(
                         f"""
                         <div class="prediction-box">
-
                             <div class="prediction-label">
                                 Confidence
                             </div>
@@ -404,10 +405,8 @@ if uploaded_file is not None:
                             <div class="confidence-value">
                                 {confidence_percent:.2f}%
                             </div>
-
                         </div>
-                        """,
-                        unsafe_allow_html=True
+                        """
                     )
 
 
@@ -460,7 +459,7 @@ if uploaded_file is not None:
 
 
                 # =================================================
-                # GRAD-CAM
+                # GRAD-CAM EXPLAINABILITY
                 # =================================================
 
                 st.markdown("---")
@@ -510,17 +509,6 @@ if uploaded_file is not None:
                     st.warning(
                         "Grad-CAM image was not returned by the API."
                     )
-
-
-                # =================================================
-                # RAW API RESPONSE
-                # =================================================
-
-                with st.expander(
-                    "View API Response"
-                ):
-
-                    st.json(result)
 
 
             # ====================================================
@@ -595,5 +583,5 @@ else:
 st.markdown("---")
 
 st.caption(
-    "KidneyVision MLOps • Swin Transformer • MLflow • FastAPI • Grad-CAM"
+    "KidneyVision MLOps • Swin Transformer • FastAPI • Grad-CAM"
 )
