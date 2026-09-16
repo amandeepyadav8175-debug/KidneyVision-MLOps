@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Dict
+import logging
 import os
+import threading
 
 import mlflow
 import torch
@@ -9,6 +11,13 @@ from PIL import Image
 
 from src.preprocessing.image_preprocessor import build_transforms
 from configs.training_config import CLASS_NAMES
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -43,13 +52,8 @@ IMAGE_SIZE = 224
 # MODEL SOURCE
 # ============================================================
 
-# Possible values:
-#
-# registry -> Load model from MLflow Model Registry
-# local    -> Load bundled model from artifacts/deployment_model
-#
-# Local development uses MLflow Registry by default.
-# Docker will set MODEL_SOURCE=local.
+# registry -> Load from MLflow Model Registry
+# local    -> Load bundled deployment model
 
 MODEL_SOURCE = os.getenv(
     "MODEL_SOURCE",
@@ -77,41 +81,71 @@ TRANSFORM = build_transforms(
 
 
 # ============================================================
-# LOAD MODEL
+# MODEL STATE
+# ============================================================
+
+MODEL = None
+
+MODEL_LOAD_ERROR = None
+
+MODEL_LOAD_LOCK = threading.Lock()
+
+
+# ============================================================
+# MODEL LOADING
 # ============================================================
 
 def load_model():
+    """
+    Load the production model from either:
 
-    # --------------------------------------------------------
-    # OPTION 1: LOAD FROM LOCAL DEPLOYMENT MODEL
-    # --------------------------------------------------------
+    1. MLflow Model Registry
+    2. Local deployment model
+
+    Returns:
+        torch.nn.Module
+
+    Raises:
+        FileNotFoundError:
+            If the local deployment model is missing.
+
+        RuntimeError:
+            If MLflow/model loading fails.
+
+        ValueError:
+            If MODEL_SOURCE is invalid.
+    """
 
     if MODEL_SOURCE == "local":
 
         model_file = DEPLOYMENT_MODEL_DIR / "MLmodel"
 
         if not model_file.exists():
+
             raise FileNotFoundError(
-                f"Deployment model not found.\n"
-                f"Expected MLmodel at:\n"
-                f"{model_file}"
+                "Deployment model not found. "
+                f"Expected MLmodel at: {model_file}"
             )
 
         model_uri = str(DEPLOYMENT_MODEL_DIR)
 
-        print(
-            f"Loading model from local deployment directory:\n"
-            f"{model_uri}"
+        logger.info(
+            "Loading model from local deployment directory: %s",
+            model_uri
         )
 
-        model = mlflow.pytorch.load_model(
-            model_uri,
-            map_location=DEVICE
-        )
+        try:
 
-    # --------------------------------------------------------
-    # OPTION 2: LOAD FROM MLflow MODEL REGISTRY
-    # --------------------------------------------------------
+            model = mlflow.pytorch.load_model(
+                model_uri,
+                map_location=DEVICE
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Failed to load local deployment model."
+            ) from exc
 
     elif MODEL_SOURCE == "registry":
 
@@ -124,25 +158,29 @@ def load_model():
             f"@{MODEL_ALIAS}"
         )
 
-        print(
-            f"Loading model from MLflow Registry:\n"
-            f"{model_uri}"
+        logger.info(
+            "Loading model from MLflow Registry: %s",
+            model_uri
         )
 
-        model = mlflow.pytorch.load_model(
-            model_uri,
-            map_location=DEVICE
-        )
+        try:
 
-    # --------------------------------------------------------
-    # INVALID MODEL SOURCE
-    # --------------------------------------------------------
+            model = mlflow.pytorch.load_model(
+                model_uri,
+                map_location=DEVICE
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Failed to load model from MLflow Registry."
+            ) from exc
 
     else:
 
         raise ValueError(
-            f"Invalid MODEL_SOURCE: {MODEL_SOURCE}\n"
-            f"Use either 'registry' or 'local'."
+            f"Invalid MODEL_SOURCE: {MODEL_SOURCE}. "
+            "Expected 'registry' or 'local'."
         )
 
     # --------------------------------------------------------
@@ -152,9 +190,20 @@ def load_model():
     model.to(DEVICE)
     model.eval()
 
-    print(f"Model loaded: {MODEL_NAME}")
-    print(f"Model source: {MODEL_SOURCE}")
-    print(f"Device: {DEVICE}")
+    logger.info(
+        "Model loaded successfully: %s",
+        MODEL_NAME
+    )
+
+    logger.info(
+        "Model source: %s",
+        MODEL_SOURCE
+    )
+
+    logger.info(
+        "Inference device: %s",
+        DEVICE
+    )
 
     return model
 
@@ -163,17 +212,68 @@ def load_model():
 # LAZY MODEL LOADING
 # ============================================================
 
-MODEL = None
-
-
 def get_model():
 
     global MODEL
+    global MODEL_LOAD_ERROR
 
-    if MODEL is None:
-        MODEL = load_model()
+    # Fast path:
+    # Model already loaded.
+    if MODEL is not None:
+        return MODEL
+
+    # Prevent multiple API requests from loading
+    # the same large model simultaneously.
+    with MODEL_LOAD_LOCK:
+
+        # Another request may have loaded the model
+        # while this request was waiting for the lock.
+        if MODEL is not None:
+            return MODEL
+
+        try:
+
+            MODEL = load_model()
+
+            MODEL_LOAD_ERROR = None
+
+        except Exception as exc:
+
+            MODEL_LOAD_ERROR = str(exc)
+
+            logger.exception(
+                "Model loading failed."
+            )
+
+            raise RuntimeError(
+                "Production model could not be loaded."
+            ) from exc
 
     return MODEL
+
+
+# ============================================================
+# MODEL STATUS
+# ============================================================
+
+def is_model_loaded() -> bool:
+    """
+    Returns True only when the model has actually
+    been successfully loaded.
+    """
+
+    return MODEL is not None
+
+
+def get_model_load_error():
+    """
+    Returns the latest model loading error.
+
+    This is mainly useful for health checks and
+    diagnostics.
+    """
+
+    return MODEL_LOAD_ERROR
 
 
 # ============================================================
@@ -181,6 +281,26 @@ def get_model():
 # ============================================================
 
 def predict_image(image: Image.Image) -> Dict:
+    """
+    Run classification on one PIL image.
+
+    Args:
+        image:
+            PIL.Image.Image
+
+    Returns:
+        Dictionary containing:
+            prediction
+            confidence
+            confidence_percent
+            probabilities
+    """
+
+    if image is None:
+
+        raise ValueError(
+            "Image cannot be None."
+        )
 
     # --------------------------------------------------------
     # CONVERT IMAGE TO RGB
@@ -204,8 +324,6 @@ def predict_image(image: Image.Image) -> Dict:
     # GET MODEL
     # --------------------------------------------------------
 
-    # IMPORTANT:
-    # Do NOT use MODEL directly because MODEL is loaded lazily.
     model = get_model()
 
     # --------------------------------------------------------
@@ -219,7 +337,22 @@ def predict_image(image: Image.Image) -> Dict:
         # Some architectures return an object
         # containing logits.
         if hasattr(output, "logits"):
+
             output = output.logits
+
+        # Validate output shape
+        if output.ndim != 2:
+
+            raise RuntimeError(
+                "Model returned an unexpected output shape."
+            )
+
+        if output.shape[1] != NUM_CLASSES:
+
+            raise RuntimeError(
+                "Model output class count does not match "
+                f"configured classes ({NUM_CLASSES})."
+            )
 
         # Convert logits to probabilities
         probabilities = F.softmax(
@@ -248,6 +381,16 @@ def predict_image(image: Image.Image) -> Dict:
     )
 
     # --------------------------------------------------------
+    # SAFETY CHECK
+    # --------------------------------------------------------
+
+    if not 0 <= predicted_index < len(CLASS_NAMES):
+
+        raise RuntimeError(
+            "Model returned an invalid class index."
+        )
+
+    # --------------------------------------------------------
     # CLASS PROBABILITIES
     # --------------------------------------------------------
 
@@ -259,7 +402,7 @@ def predict_image(image: Image.Image) -> Dict:
     ):
 
         class_probabilities[class_name] = round(
-            probability,
+            float(probability),
             6
         )
 
@@ -272,12 +415,12 @@ def predict_image(image: Image.Image) -> Dict:
         "prediction": CLASS_NAMES[predicted_index],
 
         "confidence": round(
-            confidence,
+            float(confidence),
             6
         ),
 
         "confidence_percent": round(
-            confidence * 100,
+            float(confidence * 100),
             2
         ),
 
@@ -309,5 +452,9 @@ def get_model_info():
 
         "device": str(DEVICE),
 
-        "status": "loaded"
+        "status": (
+            "loaded"
+            if is_model_loaded()
+            else "not_loaded"
+        )
     }

@@ -1,5 +1,4 @@
 import io
-import base64
 
 from PIL import Image
 from fastapi.testclient import TestClient
@@ -17,6 +16,7 @@ client = TestClient(app)
 def create_test_image():
     """
     Creates a small valid RGB JPEG image in memory.
+
     No real dataset image is required for API tests.
     """
 
@@ -74,7 +74,7 @@ def mock_gradcam(
     """
     Fake Grad-CAM generator used only during tests.
 
-    The function signature MUST match the real
+    The function signature matches the real
     generate_gradcam_for_api() function.
     """
 
@@ -123,6 +123,32 @@ def test_health_endpoint():
     data = response.json()
 
     assert data["status"] == "healthy"
+
+    # Health endpoint should expose model state
+    assert "model_loaded" in data
+
+
+# ============================================================
+# READY ENDPOINT
+# ============================================================
+
+def test_ready_endpoint(monkeypatch):
+
+    # Simulate a successfully loaded model.
+    # This prevents the test from loading the real model.
+    monkeypatch.setattr(
+        "api.main.is_model_loaded",
+        lambda: True
+    )
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["status"] == "ready"
+    assert data["model_loaded"] is True
 
 
 # ============================================================
@@ -217,7 +243,7 @@ def test_explain_endpoint(monkeypatch):
         mock_gradcam
     )
 
-    # Prevent loading the real MLflow model
+    # Prevent loading the real model
     monkeypatch.setattr(
         "api.main.get_model",
         lambda: object()
