@@ -1,8 +1,20 @@
-# ==============================
-# Python
-# ==============================
+# Environment / secrets
+.env
+.env.*
+!.env.example
 
+*.secret
+*.key
+*.pem
+
+# DVC credentials
+.dvc/config.local
+.dvc/tmp/
+
+# Python
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
 *.pyd
@@ -10,82 +22,75 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# ==============================
-# IDE / Editor
-# ==============================
-
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# ==============================
 # Git
-# ==============================
-
 .git/
 
-# ==============================
-# Datasets
-# ==============================
-
+# Dataset
 data/raw/
 data/processed/
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
 
-# ==============================
-# Generated reports
-# ==============================
+# DVC tracking file - MUST remain tracked
+!data/raw.dvc
 
+# Reports
 data/reports/
 
-# ==============================
 # MLflow
-# ==============================
-
 mlruns/
 artifacts/mlflow.db
 
-# ==============================
-# Model checkpoints
-# Large .pt files should NOT go
-# to normal GitHub repository
-# ==============================
-
+# Models / checkpoints
 artifacts/checkpoints/
+artifacts/deployment_model/
 *.pt
 *.pth
 
-# ==============================
-# Generated evaluation artifacts
-# ==============================
-
+# Generated artifacts
 artifacts/benchmark/
 artifacts/evaluation/
 artifacts/explainability/
 
-# ==============================
-# Deployment model
-# ==============================
-
-artifacts/deployment_model/
-
-# ==============================
 # Logs
-# ==============================
-
 *.log
 
-# ==============================
-# OS files
-# ==============================
-
+# OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# ==============================
-# Temporary files
-# ==============================
-
+# Temporary
 *.tmp
 *.temp
 *.bak
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache
+.cache/
