@@ -7,9 +7,9 @@ uvicorn==0.52.4
 python-multipart==0.0.32
 pillow==12.3.0
 
-numpy
-pandas
-scikit-learn
-matplotlib
+numpy==2.5.2
+pandas==3.0.5
+scikit-learn==1.9.0
+matplotlib==3.11.1
 
-streamlit
+streamlit==1.63.0
