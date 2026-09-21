@@ -16,8 +16,7 @@ COPY api ./api
 COPY src ./src
 COPY configs ./configs
 
-# Download the production EfficientNet model from GitHub Release
-# Cache-busting value forces Render/Docker to fetch the current model asset.
+# Download the production EfficientNet model
 ARG MODEL_CACHE_BUST=2
 
 RUN mkdir -p /app/artifacts/deployment_model/data && \
@@ -29,14 +28,15 @@ RUN useradd --create-home --shell /bin/bash appuser && \
 
 USER appuser
 
-EXPOSE 8000
+EXPOSE 10000
 
-# Docker health check
+# Render provides PORT at runtime.
+# Local Docker defaults to 10000 if PORT is not set.
 HEALTHCHECK \
     --interval=30s \
     --timeout=5s \
     --start-period=60s \
     --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+    CMD sh -c "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:${PORT:-10000}/health', timeout=3)\""
 
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
