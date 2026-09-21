@@ -6,19 +6,24 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV MODEL_SOURCE=local
 
+# Install API dependencies
 COPY requirements-api.txt .
 
 RUN pip install --no-cache-dir -r requirements-api.txt
 
+# Copy application code
 COPY api ./api
 COPY src ./src
 COPY configs ./configs
 
+# Download the production EfficientNet model from GitHub Release
+# Cache-busting value forces Render/Docker to fetch the current model asset.
 ARG MODEL_CACHE_BUST=2
 
 RUN mkdir -p /app/artifacts/deployment_model/data && \
     python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/amandeepyadav8175-debug/KidneyVision-MLOps/releases/download/v1.0.0/model.pth?cache=${MODEL_CACHE_BUST}', '/app/artifacts/deployment_model/data/model.pth')"
 
+# Create non-root user
 RUN useradd --create-home --shell /bin/bash appuser && \
     chown -R appuser:appuser /app
 
@@ -26,6 +31,7 @@ USER appuser
 
 EXPOSE 8000
 
+# Docker health check
 HEALTHCHECK \
     --interval=30s \
     --timeout=5s \
