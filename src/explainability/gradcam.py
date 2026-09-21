@@ -1,21 +1,10 @@
 from pathlib import Path
-import sys
 import io
+import sys
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-# -------------------------------------------------------------------
-# IMPORTANT:
-# Use a non-GUI backend because this code also runs inside FastAPI
-# and Docker/server environments.
-# -------------------------------------------------------------------
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 from PIL import Image
 
 # -------------------------------------------------------------------
@@ -82,11 +71,8 @@ def load_model():
     checkpoint = torch.load(
         CHECKPOINT_PATH,
         map_location=DEVICE,
+        weights_only=False,
     )
-
-    # ---------------------------------------------------------------
-    # Handle different checkpoint formats
-    # ---------------------------------------------------------------
 
     if isinstance(checkpoint, dict):
 
@@ -102,10 +88,6 @@ def load_model():
     else:
         state_dict = checkpoint
 
-    # ---------------------------------------------------------------
-    # Remove possible DataParallel prefix
-    # ---------------------------------------------------------------
-
     cleaned_state_dict = {}
 
     for key, value in state_dict.items():
@@ -114,10 +96,6 @@ def load_model():
             key = key[len("module."):]
 
         cleaned_state_dict[key] = value
-
-    # ---------------------------------------------------------------
-    # Load weights
-    # ---------------------------------------------------------------
 
     model.load_state_dict(
         cleaned_state_dict,
@@ -139,19 +117,63 @@ def load_model():
 
 def get_target_layer(model):
     """
-    For Swin Transformer we use the final feature block.
+    Select a spatial feature layer suitable for Grad-CAM.
 
-    TorchVision Swin produces spatial features in the form:
-        [batch, height, width, channels]
+    EfficientNet:
+        final convolutional feature block
 
-    We retain this spatial representation for Grad-CAM.
+    Swin:
+        final feature block
+
+    The API deployment model can therefore use the same Grad-CAM
+    implementation regardless of which supported model object is loaded.
     """
 
-    target_layer = model.features[-1]
+    if hasattr(model, "features"):
+
+        features = model.features
+
+        if len(features) == 0:
+            raise RuntimeError(
+                "Model features container is empty."
+            )
+
+        # EfficientNet:
+        # model.features[-1] is normally the final Conv2dNormActivation.
+        #
+        # If the final block is a Sequential container, use its final
+        # convolutional module where possible.
+        last_block = features[-1]
+
+        if isinstance(last_block, torch.nn.Sequential):
+
+            for module in reversed(list(last_block.children())):
+
+                if isinstance(
+                    module,
+                    (
+                        torch.nn.Conv2d,
+                        torch.nn.modules.conv.Conv2d,
+                    ),
+                ):
+                    target_layer = module
+                    break
+
+            else:
+                target_layer = last_block
+
+        else:
+            target_layer = last_block
+
+    else:
+        raise RuntimeError(
+            "Unable to automatically locate a Grad-CAM target layer "
+            f"for model type: {type(model).__name__}"
+        )
 
     print(
-        f"Grad-CAM target layer: "
-        f"{target_layer.__class__.__name__}"
+        "Grad-CAM target layer:",
+        target_layer.__class__.__name__,
     )
 
     return target_layer
@@ -163,7 +185,11 @@ def get_target_layer(model):
 
 class GradCAM:
 
-    def __init__(self, model, target_layer):
+    def __init__(
+        self,
+        model,
+        target_layer,
+    ):
 
         self.model = model
         self.target_layer = target_layer
@@ -175,25 +201,41 @@ class GradCAM:
             self.save_activation
         )
 
-        self.backward_handle = target_layer.register_full_backward_hook(
-            self.save_gradient
-        )
+        self.backward_handle = None
 
     # ---------------------------------------------------------------
     # Save activation
     # ---------------------------------------------------------------
 
-    def save_activation(self, module, input, output):
+    def save_activation(
+        self,
+        module,
+        input_data,
+        output,
+    ):
 
         self.activations = output
+
+        # Instead of using a module backward hook, attach a tensor
+        # gradient hook directly to the activation tensor.
+        #
+        # This is lighter and avoids some backward-hook overhead.
+
+        if isinstance(output, torch.Tensor) and output.requires_grad:
+
+            output.register_hook(
+                self.save_tensor_gradient
+            )
 
     # ---------------------------------------------------------------
     # Save gradient
     # ---------------------------------------------------------------
 
-    def save_gradient(self, module, grad_input, grad_output):
+    def save_tensor_gradient(self, gradient):
 
-        self.gradients = grad_output[0]
+        self.gradients = gradient
+
+        return gradient
 
     # ---------------------------------------------------------------
     # Remove hooks
@@ -202,15 +244,19 @@ class GradCAM:
     def remove_hooks(self):
 
         if self.forward_handle is not None:
+
             self.forward_handle.remove()
+
             self.forward_handle = None
 
         if self.backward_handle is not None:
+
             self.backward_handle.remove()
+
             self.backward_handle = None
 
     # ---------------------------------------------------------------
-    # Context manager support
+    # Context manager
     # ---------------------------------------------------------------
 
     def __enter__(self):
@@ -226,6 +272,9 @@ class GradCAM:
 
         self.remove_hooks()
 
+        self.activations = None
+        self.gradients = None
+
     # ---------------------------------------------------------------
     # Generate CAM
     # ---------------------------------------------------------------
@@ -236,7 +285,6 @@ class GradCAM:
         class_index,
     ):
 
-        # Clear old activation/gradient data.
         self.activations = None
         self.gradients = None
 
@@ -244,21 +292,19 @@ class GradCAM:
 
         output = self.model(input_tensor)
 
-        # -----------------------------------------------------------
-        # Handle models that return objects such as Inception output
-        # -----------------------------------------------------------
-
         if hasattr(output, "logits"):
             output = output.logits
 
         if not isinstance(output, torch.Tensor):
+
             raise RuntimeError(
                 "Model output is not a torch.Tensor."
             )
 
         if output.ndim != 2:
+
             raise RuntimeError(
-                f"Unexpected model output shape: "
+                "Unexpected model output shape: "
                 f"{tuple(output.shape)}"
             )
 
@@ -266,66 +312,72 @@ class GradCAM:
             class_index < 0
             or class_index >= output.shape[1]
         ):
+
             raise ValueError(
                 f"Invalid class index: {class_index}. "
                 f"Model has {output.shape[1]} classes."
             )
 
-        # -----------------------------------------------------------
-        # Backpropagate target class score
-        # -----------------------------------------------------------
+        if self.activations is None:
+
+            raise RuntimeError(
+                "Grad-CAM activations were not captured."
+            )
 
         score = output[:, class_index].sum()
 
         score.backward()
 
-        activations = self.activations
         gradients = self.gradients
-
-        if activations is None:
-            raise RuntimeError(
-                "Grad-CAM activations were not captured."
-            )
+        activations = self.activations
 
         if gradients is None:
+
             raise RuntimeError(
                 "Grad-CAM gradients were not captured."
             )
 
         # -----------------------------------------------------------
-        # Swin output:
-        # [B, H, W, C]
-        #
-        # Convert to:
-        # [B, C, H, W]
+        # Convert feature layout
         # -----------------------------------------------------------
 
-        if activations.ndim == 4:
-
-            if (
-                activations.shape[-1] == gradients.shape[-1]
-                and activations.shape[1] < activations.shape[-1]
-            ):
-
-                activations = activations.permute(
-                    0,
-                    3,
-                    1,
-                    2,
-                )
-
-                gradients = gradients.permute(
-                    0,
-                    3,
-                    1,
-                    2,
-                )
-
-        else:
+        if activations.ndim != 4:
 
             raise RuntimeError(
-                f"Unexpected activation shape: "
+                "Expected 4D Grad-CAM activations, got: "
                 f"{tuple(activations.shape)}"
+            )
+
+        if gradients.ndim != 4:
+
+            raise RuntimeError(
+                "Expected 4D Grad-CAM gradients, got: "
+                f"{tuple(gradients.shape)}"
+            )
+
+        # Swin:
+        # [B, H, W, C]
+        #
+        # CNN:
+        # [B, C, H, W]
+
+        if (
+            activations.shape[1] < activations.shape[-1]
+            and activations.shape[2] < activations.shape[-1]
+        ):
+
+            activations = activations.permute(
+                0,
+                3,
+                1,
+                2,
+            )
+
+            gradients = gradients.permute(
+                0,
+                3,
+                1,
+                2,
             )
 
         # -----------------------------------------------------------
@@ -355,7 +407,7 @@ class GradCAM:
         cam = F.relu(cam)
 
         # -----------------------------------------------------------
-        # Resize CAM to input image size
+        # Resize CAM
         # -----------------------------------------------------------
 
         cam = F.interpolate(
@@ -365,28 +417,35 @@ class GradCAM:
             align_corners=False,
         )
 
-        cam = cam.squeeze()
+        cam = cam.squeeze(0).squeeze(0)
 
         # -----------------------------------------------------------
-        # Normalize between 0 and 1
+        # Normalize
         # -----------------------------------------------------------
 
         cam_min = cam.min()
         cam_max = cam.max()
 
-        if (cam_max - cam_min) > 1e-8:
+        denominator = cam_max - cam_min
+
+        if denominator > 1e-8:
 
             cam = (
                 cam - cam_min
-            ) / (
-                cam_max - cam_min
-            )
+            ) / denominator
 
         else:
 
             cam = torch.zeros_like(cam)
 
-        return output.detach(), cam.detach()
+        # Detach immediately to release autograd graph.
+        output = output.detach()
+        cam = cam.detach()
+
+        self.activations = None
+        self.gradients = None
+
+        return output, cam
 
 
 # -------------------------------------------------------------------
@@ -412,7 +471,202 @@ def prepare_image(image_path):
 
 
 # -------------------------------------------------------------------
-# Create visualization
+# Simple heatmap generation without Matplotlib
+# -------------------------------------------------------------------
+
+def create_heatmap(cam_array):
+    """
+    Convert normalized CAM [0,1] into an RGB heatmap.
+
+    This intentionally avoids Matplotlib because the API runs on
+    low-memory deployment instances.
+    """
+
+    cam_array = np.clip(
+        cam_array,
+        0.0,
+        1.0,
+    )
+
+    # Simple blue -> cyan -> yellow -> red style gradient.
+    r = np.clip(
+        2.0 * cam_array - 0.5,
+        0.0,
+        1.0,
+    )
+
+    g = np.clip(
+        2.0 - np.abs(4.0 * cam_array - 2.0),
+        0.0,
+        1.0,
+    )
+
+    b = np.clip(
+        1.5 - 2.0 * cam_array,
+        0.0,
+        1.0,
+    )
+
+    heatmap = np.stack(
+        [r, g, b],
+        axis=-1,
+    )
+
+    return (
+        heatmap * 255.0
+    ).astype(np.uint8)
+
+
+# -------------------------------------------------------------------
+# Create visualization without Matplotlib
+# -------------------------------------------------------------------
+
+def create_gradcam_image(
+    original_image,
+    cam,
+    predicted_class,
+    confidence,
+):
+    """
+    Create a compact Grad-CAM visualization entirely with PIL/NumPy.
+
+    Returns:
+        PNG bytes
+    """
+
+    original_image = original_image.convert(
+        "RGB"
+    ).resize(
+        (IMAGE_SIZE, IMAGE_SIZE),
+        Image.Resampling.BILINEAR,
+    )
+
+    original_array = np.asarray(
+        original_image,
+        dtype=np.float32,
+    )
+
+    cam_array = cam.cpu().numpy()
+
+    cam_array = np.clip(
+        cam_array,
+        0.0,
+        1.0,
+    )
+
+    # ---------------------------------------------------------------
+    # Heatmap
+    # ---------------------------------------------------------------
+
+    heatmap_array = create_heatmap(
+        cam_array
+    )
+
+    heatmap_image = Image.fromarray(
+        heatmap_array,
+        mode="RGB",
+    )
+
+    # ---------------------------------------------------------------
+    # Overlay
+    # ---------------------------------------------------------------
+
+    overlay_array = (
+        0.55 * original_array
+        + 0.45 * heatmap_array.astype(np.float32)
+    )
+
+    overlay_array = np.clip(
+        overlay_array,
+        0,
+        255,
+    ).astype(np.uint8)
+
+    overlay_image = Image.fromarray(
+        overlay_array,
+        mode="RGB",
+    )
+
+    # ---------------------------------------------------------------
+    # Build 3-panel image using PIL
+    # ---------------------------------------------------------------
+
+    panel_width = IMAGE_SIZE
+    panel_height = IMAGE_SIZE + 35
+
+    canvas = Image.new(
+        "RGB",
+        (
+            panel_width * 3,
+            panel_height,
+        ),
+        "white",
+    )
+
+    canvas.paste(
+        original_image,
+        (0, 0),
+    )
+
+    canvas.paste(
+        heatmap_image,
+        (panel_width, 0),
+    )
+
+    canvas.paste(
+        overlay_image,
+        (panel_width * 2, 0),
+    )
+
+    # Add simple labels.
+    try:
+
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(canvas)
+
+        draw.text(
+            (10, IMAGE_SIZE + 8),
+            "Original CT Image",
+            fill="black",
+        )
+
+        draw.text(
+            (panel_width + 10, IMAGE_SIZE + 8),
+            "Grad-CAM",
+            fill="black",
+        )
+
+        draw.text(
+            (panel_width * 2 + 10, IMAGE_SIZE + 8),
+            f"{predicted_class} {confidence:.2%}",
+            fill="black",
+        )
+
+    except Exception:
+        pass
+
+    # ---------------------------------------------------------------
+    # Encode PNG in memory
+    # ---------------------------------------------------------------
+
+    image_buffer = io.BytesIO()
+
+    canvas.save(
+        image_buffer,
+        format="PNG",
+        optimize=True,
+    )
+
+    image_bytes = image_buffer.getvalue()
+
+    image_buffer.close()
+
+    return image_bytes
+
+
+# -------------------------------------------------------------------
+# Save visualization for local CLI
 # -------------------------------------------------------------------
 
 def save_gradcam_visualization(
@@ -423,93 +677,23 @@ def save_gradcam_visualization(
     output_path,
 ):
 
-    # ---------------------------------------------------------------
-    # Resize original image
-    # ---------------------------------------------------------------
-
-    original_image = original_image.resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
+    image_bytes = create_gradcam_image(
+        original_image=original_image,
+        cam=cam,
+        predicted_class=predicted_class,
+        confidence=confidence,
     )
 
-    original_array = (
-        np.asarray(original_image)
-        .astype(np.float32)
-        / 255.0
+    output_path = Path(output_path)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    cam_array = cam.cpu().numpy()
-
-    figure = plt.figure(
-        figsize=(12, 4)
+    output_path.write_bytes(
+        image_bytes
     )
-
-    # ---------------------------------------------------------------
-    # Original image
-    # ---------------------------------------------------------------
-
-    plt.subplot(1, 3, 1)
-
-    plt.imshow(original_array)
-
-    plt.title(
-        "Original CT Image"
-    )
-
-    plt.axis("off")
-
-    # ---------------------------------------------------------------
-    # Grad-CAM
-    # ---------------------------------------------------------------
-
-    plt.subplot(1, 3, 2)
-
-    plt.imshow(
-        cam_array,
-        cmap="jet",
-    )
-
-    plt.title(
-        "Grad-CAM"
-    )
-
-    plt.axis("off")
-
-    # ---------------------------------------------------------------
-    # Overlay
-    # ---------------------------------------------------------------
-
-    plt.subplot(1, 3, 3)
-
-    plt.imshow(
-        original_array
-    )
-
-    plt.imshow(
-        cam_array,
-        cmap="jet",
-        alpha=0.45,
-    )
-
-    plt.title(
-        f"Prediction: {predicted_class}\n"
-        f"Confidence: {confidence:.2%}"
-    )
-
-    plt.axis("off")
-
-    plt.tight_layout()
-
-    # ---------------------------------------------------------------
-    # Save figure
-    # ---------------------------------------------------------------
-
-    figure.savefig(
-        output_path,
-        dpi=200,
-        bbox_inches="tight",
-    )
-
-    plt.close(figure)
 
 
 # -------------------------------------------------------------------
@@ -524,19 +708,14 @@ def generate_gradcam_for_api(
     confidence,
 ):
     """
-    Generate a Grad-CAM visualization for a PIL image.
+    Generate a Grad-CAM PNG for the FastAPI backend.
 
-    This function is designed to be called by the FastAPI backend.
-
-    The already-loaded model is used instead of loading the checkpoint
-    again.
-
-    Hooks are automatically removed after Grad-CAM generation.
+    Important:
+    - Does not load another model.
+    - Does not import/use Matplotlib.
+    - Performs exactly one forward/backward Grad-CAM pass.
+    - Removes hooks automatically.
     """
-
-    # ---------------------------------------------------------------
-    # Prepare image
-    # ---------------------------------------------------------------
 
     transform = build_transforms(
         image_size=IMAGE_SIZE,
@@ -549,140 +728,51 @@ def generate_gradcam_for_api(
 
     input_tensor = input_tensor.unsqueeze(0)
 
-    input_tensor = input_tensor.to(DEVICE)
+    input_tensor = input_tensor.to(
+        DEVICE
+    )
 
-    # ---------------------------------------------------------------
-    # Target layer
-    # ---------------------------------------------------------------
-
-    target_layer = get_target_layer(model)
-
-    # ---------------------------------------------------------------
-    # Grad-CAM
-    #
-    # Context manager guarantees hook cleanup even if an exception
-    # occurs during generation.
-    # ---------------------------------------------------------------
+    target_layer = get_target_layer(
+        model
+    )
 
     try:
 
         with GradCAM(
-            model,
-            target_layer,
+            model=model,
+            target_layer=target_layer,
         ) as gradcam:
 
             with torch.enable_grad():
 
                 _, cam = gradcam.generate(
-                    input_tensor,
-                    class_index=predicted_index,
+                    input_tensor=input_tensor,
+                    class_index=int(
+                        predicted_index
+                    ),
                 )
 
         # -----------------------------------------------------------
-        # Create image in memory
+        # Create compact visualization
         # -----------------------------------------------------------
 
-        original_image = image.convert(
-            "RGB"
-        ).resize(
-            (IMAGE_SIZE, IMAGE_SIZE)
+        image_bytes = create_gradcam_image(
+            original_image=image,
+            cam=cam,
+            predicted_class=predicted_class,
+            confidence=confidence,
         )
 
-        original_array = (
-            np.asarray(original_image)
-            .astype(np.float32)
-            / 255.0
-        )
+        return image_bytes
 
-        cam_array = cam.cpu().numpy()
+    finally:
 
-        figure = plt.figure(
-            figsize=(12, 4)
-        )
+        # Release references immediately.
+        input_tensor = None
+        cam = None
 
-        # -----------------------------------------------------------
-        # Original
-        # -----------------------------------------------------------
-
-        plt.subplot(1, 3, 1)
-
-        plt.imshow(
-            original_array
-        )
-
-        plt.title(
-            "Original CT Image"
-        )
-
-        plt.axis("off")
-
-        # -----------------------------------------------------------
-        # Grad-CAM
-        # -----------------------------------------------------------
-
-        plt.subplot(1, 3, 2)
-
-        plt.imshow(
-            cam_array,
-            cmap="jet",
-        )
-
-        plt.title(
-            "Grad-CAM"
-        )
-
-        plt.axis("off")
-
-        # -----------------------------------------------------------
-        # Overlay
-        # -----------------------------------------------------------
-
-        plt.subplot(1, 3, 3)
-
-        plt.imshow(
-            original_array
-        )
-
-        plt.imshow(
-            cam_array,
-            cmap="jet",
-            alpha=0.45,
-        )
-
-        plt.title(
-            f"Prediction: {predicted_class}\n"
-            f"Confidence: {confidence:.2%}"
-        )
-
-        plt.axis("off")
-
-        plt.tight_layout()
-
-        # -----------------------------------------------------------
-        # Save figure into memory
-        # -----------------------------------------------------------
-
-        image_buffer = io.BytesIO()
-
-        figure.savefig(
-            image_buffer,
-            format="png",
-            dpi=150,
-            bbox_inches="tight",
-        )
-
-        plt.close(figure)
-
-        image_buffer.seek(0)
-
-        return image_buffer.getvalue()
-
-    except Exception:
-
-        # Make absolutely sure matplotlib figures are not left open.
-        plt.close("all")
-
-        raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # -------------------------------------------------------------------
@@ -696,6 +786,7 @@ def main():
     print("=" * 70)
 
     print()
+
     print(
         f"Checkpoint : {CHECKPOINT_PATH}"
     )
@@ -708,7 +799,7 @@ def main():
         )
 
     # ---------------------------------------------------------------
-    # Find one test image
+    # Find test image
     # ---------------------------------------------------------------
 
     test_manifest = (
@@ -760,10 +851,6 @@ def main():
 
     model = load_model()
 
-    target_layer = get_target_layer(
-        model
-    )
-
     # ---------------------------------------------------------------
     # Prepare image
     # ---------------------------------------------------------------
@@ -778,59 +865,41 @@ def main():
     )
 
     # ---------------------------------------------------------------
-    # Generate prediction + Grad-CAM
+    # Prediction first
     # ---------------------------------------------------------------
 
-    try:
+    with torch.no_grad():
 
-        with GradCAM(
-            model,
-            target_layer,
-        ) as gradcam:
+        output = model(
+            input_tensor
+        )
 
-            with torch.enable_grad():
+        if hasattr(output, "logits"):
+            output = output.logits
 
-                # First pass: get prediction.
-                output, _ = gradcam.generate(
-                    input_tensor,
-                    class_index=0,
-                )
+        probabilities = torch.softmax(
+            output,
+            dim=1,
+        )
 
-                probabilities = torch.softmax(
-                    output,
-                    dim=1,
-                )
+        predicted_index = int(
+            torch.argmax(
+                probabilities,
+                dim=1,
+            ).item()
+        )
 
-                predicted_index = int(
-                    torch.argmax(
-                        probabilities,
-                        dim=1,
-                    ).item()
-                )
+        predicted_class = CLASS_NAMES[
+            predicted_index
+        ]
 
-                predicted_class = CLASS_NAMES[
-                    predicted_index
-                ]
+        confidence = float(
+            probabilities[
+                0,
+                predicted_index,
+            ].item()
+        )
 
-                confidence = float(
-                    probabilities[
-                        0,
-                        predicted_index,
-                    ].item()
-                )
-
-                # Second pass: generate CAM for
-                # the actual predicted class.
-                output, cam = gradcam.generate(
-                    input_tensor,
-                    class_index=predicted_index,
-                )
-
-    finally:
-
-        plt.close("all")
-
-    print()
     print(
         f"Predicted class : {predicted_class}"
     )
@@ -838,6 +907,26 @@ def main():
     print(
         f"Confidence      : {confidence:.4f}"
     )
+
+    # ---------------------------------------------------------------
+    # Grad-CAM
+    # ---------------------------------------------------------------
+
+    target_layer = get_target_layer(
+        model
+    )
+
+    with GradCAM(
+        model=model,
+        target_layer=target_layer,
+    ) as gradcam:
+
+        with torch.enable_grad():
+
+            _, cam = gradcam.generate(
+                input_tensor=input_tensor,
+                class_index=predicted_index,
+            )
 
     print(
         f"CAM shape       : {tuple(cam.shape)}"
@@ -861,11 +950,13 @@ def main():
     )
 
     print()
+
     print(
         f"Grad-CAM saved  : {output_path}"
     )
 
     print()
+
     print("=" * 70)
     print("GRAD-CAM COMPLETE")
     print("=" * 70)
