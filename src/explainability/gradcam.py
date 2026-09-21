@@ -1,3 +1,22 @@
+"""
+KidneyVision-MLOps
+Grad-CAM Explainability
+
+Production-safe Grad-CAM implementation for:
+- FastAPI inference
+- EfficientNet-B0
+- Swin Transformer
+- CPU deployment
+- Render free-tier deployment
+
+Important:
+The FastAPI endpoint passes both:
+    predicted_index
+    predicted_class
+
+This module accepts both forms safely.
+"""
+
 from pathlib import Path
 import io
 
@@ -6,40 +25,259 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from src.models.model_factory import create_model
+from configs.training_config import CLASS_NAMES
 from src.preprocessing.image_preprocessor import build_transforms
 
 
 # ============================================================
-# PROJECT CONFIG
+# PROJECT CONFIGURATION
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-CLASS_NAMES = [
-    "Normal",
-    "Cyst",
-    "Stone",
-    "Tumor",
-]
-
 IMAGE_SIZE = 224
 
-# Keep visualization small to reduce memory usage.
 GRADCAM_IMAGE_SIZE = 160
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-
-# Used only by the local Grad-CAM CLI.
-# FastAPI receives an already-loaded model from api.inference.
-CHECKPOINT_PATH = (
+OUTPUT_DIR = (
     PROJECT_ROOT
     / "artifacts"
-    / "checkpoints"
-    / "swintransformer_best.pt"
+    / "explainability"
+    / "gradcam"
 )
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+DEVICE = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+
+# ============================================================
+# CLASS HELPERS
+# ============================================================
+
+def class_name_to_index(class_name):
+    """
+    Convert class name to class index.
+
+    Example:
+        Cyst -> 1
+        Normal -> 0
+        Stone -> 2
+        Tumor -> 3
+    """
+
+    if not isinstance(class_name, str):
+        raise TypeError(
+            "class_name must be a string."
+        )
+
+    if class_name not in CLASS_NAMES:
+        raise ValueError(
+            f"Unknown class '{class_name}'. "
+            f"Expected one of: {CLASS_NAMES}"
+        )
+
+    return CLASS_NAMES.index(
+        class_name
+    )
+
+
+def normalize_class_index(
+    predicted_index=None,
+    predicted_class=None,
+):
+    """
+    Resolve the final integer class index.
+
+    The API normally supplies:
+
+        predicted_index = 1
+        predicted_class = "Cyst"
+
+    This function also safely handles cases where
+    predicted_index accidentally arrives as a class name.
+    """
+
+    # --------------------------------------------------------
+    # If predicted_index is already an integer
+    # --------------------------------------------------------
+
+    if isinstance(
+        predicted_index,
+        (int, np.integer),
+    ):
+
+        index = int(
+            predicted_index
+        )
+
+    # --------------------------------------------------------
+    # If predicted_index is a string
+    #
+    # Example:
+    # predicted_index = "Cyst"
+    #
+    # Never do int("Cyst").
+    # --------------------------------------------------------
+
+    elif isinstance(
+        predicted_index,
+        str,
+    ):
+
+        if predicted_index in CLASS_NAMES:
+
+            index = class_name_to_index(
+                predicted_index
+            )
+
+        else:
+
+            try:
+
+                index = int(
+                    predicted_index
+                )
+
+            except ValueError:
+
+                if predicted_class in CLASS_NAMES:
+
+                    index = class_name_to_index(
+                        predicted_class
+                    )
+
+                else:
+
+                    raise ValueError(
+                        "Could not resolve predicted class/index. "
+                        f"predicted_index={predicted_index!r}, "
+                        f"predicted_class={predicted_class!r}, "
+                        f"expected classes={CLASS_NAMES}"
+                    )
+
+    # --------------------------------------------------------
+    # If no index was supplied, use predicted_class
+    # --------------------------------------------------------
+
+    elif predicted_index is None:
+
+        if predicted_class in CLASS_NAMES:
+
+            index = class_name_to_index(
+                predicted_class
+            )
+
+        else:
+
+            raise ValueError(
+                "predicted_index is None and "
+                "predicted_class is invalid."
+            )
+
+    else:
+
+        raise TypeError(
+            "predicted_index must be an integer, "
+            "string, or None."
+        )
+
+    # --------------------------------------------------------
+    # Validate range
+    # --------------------------------------------------------
+
+    if index < 0 or index >= len(CLASS_NAMES):
+
+        raise ValueError(
+            f"Invalid class index {index}. "
+            f"Expected range 0-{len(CLASS_NAMES) - 1}."
+        )
+
+    return index
+
+
+# ============================================================
+# MODEL OUTPUT HELPER
+# ============================================================
+
+def extract_logits(output):
+    """
+    Extract logits from different TorchVision model outputs.
+
+    Supports:
+    - Tensor
+    - Inception-style objects with .logits
+    - tuples/lists
+    """
+
+    # --------------------------------------------------------
+    # Normal Tensor
+    # --------------------------------------------------------
+
+    if isinstance(
+        output,
+        torch.Tensor,
+    ):
+
+        return output
+
+    # --------------------------------------------------------
+    # Inception / named output object
+    # --------------------------------------------------------
+
+    if hasattr(
+        output,
+        "logits",
+    ):
+
+        return output.logits
+
+    # --------------------------------------------------------
+    # Tuple/list
+    # --------------------------------------------------------
+
+    if isinstance(
+        output,
+        (tuple, list),
+    ):
+
+        if len(output) == 0:
+
+            raise RuntimeError(
+                "Model returned an empty tuple/list."
+            )
+
+        first_output = output[0]
+
+        if isinstance(
+            first_output,
+            torch.Tensor,
+        ):
+
+            return first_output
+
+        if hasattr(
+            first_output,
+            "logits",
+        ):
+
+            return first_output.logits
+
+    raise RuntimeError(
+        "Could not extract logits from model output."
+    )
 
 
 # ============================================================
@@ -48,62 +286,112 @@ CHECKPOINT_PATH = (
 
 def get_target_layer(model):
     """
-    Find a suitable Grad-CAM target layer.
+    Select a spatial feature layer suitable for Grad-CAM.
 
-    Works with:
-    - EfficientNet
-    - Swin Transformer
-    - other CNN-style models with Conv2d layers
+    EfficientNet:
+        model.features[-1]
+
+    Swin:
+        model.features[-1]
+
+    Generic CNN:
+        Searches backwards for a suitable module.
+
+    The selected layer must produce a spatial feature map.
     """
 
     # --------------------------------------------------------
-    # Models with a `features` Sequential block.
-    # EfficientNet uses this.
+    # EfficientNet / Swin / similar TorchVision models
     # --------------------------------------------------------
 
-    if hasattr(model, "features"):
+    if hasattr(
+        model,
+        "features",
+    ):
 
         features = model.features
 
-        if isinstance(features, torch.nn.Sequential):
+        if len(features) > 0:
 
-            for layer in reversed(
-                list(features)
+            target_layer = features[-1]
+
+            print(
+                "Grad-CAM target layer:",
+                target_layer.__class__.__name__,
+            )
+
+            return target_layer
+
+    # --------------------------------------------------------
+    # ResNet-style models
+    # --------------------------------------------------------
+
+    if hasattr(
+        model,
+        "layer4",
+    ):
+
+        target_layer = model.layer4[-1]
+
+        print(
+            "Grad-CAM target layer:",
+            target_layer.__class__.__name__,
+        )
+
+        return target_layer
+
+    # --------------------------------------------------------
+    # VGG-style models
+    # --------------------------------------------------------
+
+    if hasattr(
+        model,
+        "features",
+    ):
+
+        for module in reversed(
+            list(model.features)
+        ):
+
+            if isinstance(
+                module,
+                torch.nn.Conv2d,
             ):
 
-                if layer is not None:
-                    return layer
+                print(
+                    "Grad-CAM target layer:",
+                    module.__class__.__name__,
+                )
 
-        if features is not None:
-            return features
+                return module
 
     # --------------------------------------------------------
-    # Generic fallback: search for the last Conv2d.
+    # Generic fallback
     # --------------------------------------------------------
 
-    modules = list(
-        model.named_modules()
-    )
+    candidate_layers = []
 
-    for _, module in reversed(modules):
+    for module in model.modules():
 
         if isinstance(
             module,
             torch.nn.Conv2d,
         ):
-            return module
 
-    # --------------------------------------------------------
-    # Generic Sequential fallback.
-    # --------------------------------------------------------
+            candidate_layers.append(
+                module
+            )
 
-    for _, module in reversed(modules):
+    if candidate_layers:
 
-        if isinstance(
-            module,
-            torch.nn.Sequential,
-        ):
-            return module
+        target_layer = candidate_layers[-1]
+
+        print(
+            "Grad-CAM target layer:",
+            target_layer.__class__.__name__,
+        )
+
+        return target_layer
 
     raise RuntimeError(
         "Could not find a suitable Grad-CAM target layer."
@@ -116,12 +404,10 @@ def get_target_layer(model):
 
 class GradCAM:
     """
-    Lightweight Grad-CAM implementation.
+    Memory-conscious Grad-CAM implementation.
 
-    Uses a forward hook to capture activations.
-
-    Gradients are obtained with torch.autograd.grad()
-    instead of a backward hook to reduce memory overhead.
+    Only one forward hook is kept.
+    Gradients are obtained directly with autograd.grad().
     """
 
     def __init__(
@@ -129,23 +415,16 @@ class GradCAM:
         model,
         target_layer,
     ):
+
         self.model = model
         self.target_layer = target_layer
 
         self.activations = None
-        self.hook = None
+        self.activation_handle = None
 
-        self._register_hook()
-
-    # --------------------------------------------------------
-    # Register forward hook
-    # --------------------------------------------------------
-
-    def _register_hook(self):
-
-        self.hook = (
+        self.activation_handle = (
             self.target_layer.register_forward_hook(
-                self._forward_hook
+                self._save_activation
             )
         )
 
@@ -153,487 +432,498 @@ class GradCAM:
     # Forward hook
     # --------------------------------------------------------
 
-    def _forward_hook(
+    def _save_activation(
         self,
         module,
         inputs,
         output,
     ):
+
         self.activations = output
 
     # --------------------------------------------------------
     # Remove hook
     # --------------------------------------------------------
 
-    def remove(self):
+    def close(self):
 
-        if self.hook is not None:
+        if (
+            self.activation_handle
+            is not None
+        ):
 
-            self.hook.remove()
-            self.hook = None
+            self.activation_handle.remove()
+
+            self.activation_handle = None
+
+        self.activations = None
 
     # --------------------------------------------------------
-    # Generate Grad-CAM
+    # Context manager
+    # --------------------------------------------------------
+
+    def __enter__(self):
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
+
+        self.close()
+
+        return False
+
+    # --------------------------------------------------------
+    # Generate CAM
     # --------------------------------------------------------
 
     def generate(
         self,
         input_tensor,
-        target_class,
+        class_index,
     ):
-        """
-        Generate Grad-CAM.
 
-        Returns:
-            Tensor with shape [B, H, W]
-        """
+        if not isinstance(
+            class_index,
+            int,
+        ):
+
+            class_index = normalize_class_index(
+                predicted_index=class_index
+            )
+
+        self.model.zero_grad(
+            set_to_none=True
+        )
 
         self.activations = None
 
-        with torch.enable_grad():
+        # ----------------------------------------------------
+        # Forward pass
+        # ----------------------------------------------------
 
-            # ------------------------------------------------
-            # Forward pass
-            # ------------------------------------------------
+        output = self.model(
+            input_tensor
+        )
 
-            output = self.model(
-                input_tensor
+        logits = extract_logits(
+            output
+        )
+
+        if logits.ndim != 2:
+
+            raise RuntimeError(
+                "Model output must have shape "
+                "[batch, classes]. "
+                f"Received: {tuple(logits.shape)}"
             )
 
-            # ------------------------------------------------
-            # Extract logits
-            # ------------------------------------------------
+        if class_index < 0:
 
-            if hasattr(
-                output,
-                "logits",
+            raise ValueError(
+                f"Invalid class index: {class_index}"
+            )
+
+        if class_index >= logits.shape[1]:
+
+            raise ValueError(
+                f"Class index {class_index} is outside "
+                f"model output range 0-{logits.shape[1] - 1}."
+            )
+
+        # ----------------------------------------------------
+        # Make sure target activation exists
+        # ----------------------------------------------------
+
+        activations = self.activations
+
+        if activations is None:
+
+            raise RuntimeError(
+                "Grad-CAM target layer did not produce "
+                "activations."
+            )
+
+        if not isinstance(
+            activations,
+            torch.Tensor,
+        ):
+
+            raise RuntimeError(
+                "Grad-CAM target layer output is not a Tensor."
+            )
+
+        # ----------------------------------------------------
+        # Select target score
+        # ----------------------------------------------------
+
+        score = logits[
+            0,
+            class_index
+        ]
+
+        # ----------------------------------------------------
+        # Direct gradient calculation
+        #
+        # This avoids register_full_backward_hook(),
+        # which is more fragile for deployment.
+        # ----------------------------------------------------
+
+        gradients = torch.autograd.grad(
+            outputs=score,
+            inputs=activations,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )[0]
+
+        # ----------------------------------------------------
+        # Convert Swin layout:
+        #
+        # [B, H, W, C]
+        #
+        # into:
+        #
+        # [B, C, H, W]
+        # ----------------------------------------------------
+
+        if activations.ndim == 4:
+
+            if (
+                activations.shape[1]
+                == activations.shape[2]
+                and
+                activations.shape[3]
+                != activations.shape[1]
             ):
 
-                logits = output.logits
+                # Already B,C,H,W
+                activation_tensor = activations
 
-            elif isinstance(
-                output,
-                tuple,
+                gradient_tensor = gradients
+
+            elif (
+                activations.shape[1]
+                != activations.shape[3]
+                and
+                activations.shape[2]
+                != activations.shape[3]
             ):
 
-                logits = output[0]
-
-            else:
-
-                logits = output
-
-            if logits.ndim != 2:
-
-                raise RuntimeError(
-                    "Expected model output with shape "
-                    f"[B, C], got {tuple(logits.shape)}"
-                )
-
-            # ------------------------------------------------
-            # Target score
-            # ------------------------------------------------
-
-            score = logits[
-                :,
-                target_class,
-            ].sum()
-
-            # ------------------------------------------------
-            # Activations must exist.
-            # ------------------------------------------------
-
-            if self.activations is None:
-
-                raise RuntimeError(
-                    "Grad-CAM target layer did not "
-                    "produce activations."
-                )
-
-            activations = self.activations
-
-            # ------------------------------------------------
-            # Convert activation layout.
-            #
-            # CNN:
-            # [B, C, H, W]
-            #
-            # Transformer:
-            # [B, H, W, C]
-            # or [B, N, C]
-            # ------------------------------------------------
-
-            if activations.ndim == 4:
-
-                # Most CNN models.
-                if (
-                    activations.shape[1] <= 2048
-                    and activations.shape[2] > 1
-                    and activations.shape[3] > 1
-                ):
-
-                    activation_tensor = activations
-
-                else:
-
-                    # Transformer layout:
-                    # [B, H, W, C]
-                    activation_tensor = (
-                        activations
-                        .permute(
-                            0,
-                            3,
-                            1,
-                            2,
-                        )
-                        .contiguous()
-                    )
-
-            elif activations.ndim == 3:
-
-                # Transformer sequence:
-                # [B, N, C]
-
-                batch_size, tokens, channels = (
-                    activations.shape
-                )
-
-                side = int(
-                    np.sqrt(tokens)
-                )
-
-                if side * side != tokens:
-
-                    raise RuntimeError(
-                        "Cannot reshape transformer "
-                        f"activation with {tokens} tokens "
-                        "into a square feature map."
-                    )
-
+                # Usually B,H,W,C
                 activation_tensor = (
                     activations
-                    .transpose(
+                    .permute(
+                        0,
+                        3,
                         1,
                         2,
                     )
                     .contiguous()
-                    .view(
-                        batch_size,
-                        channels,
-                        side,
-                        side,
-                    )
-                )
-
-            else:
-
-                raise RuntimeError(
-                    "Unsupported activation shape: "
-                    f"{tuple(activations.shape)}"
-                )
-
-            # ------------------------------------------------
-            # Gradient of target score with respect to
-            # captured activations.
-            # ------------------------------------------------
-
-            gradients = torch.autograd.grad(
-                outputs=score,
-                inputs=activations,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=False,
-            )[0]
-
-            # ------------------------------------------------
-            # Match gradient layout.
-            # ------------------------------------------------
-
-            if gradients.ndim == 4:
-
-                if (
-                    gradients.shape[1] <= 2048
-                    and gradients.shape[2] > 1
-                    and gradients.shape[3] > 1
-                ):
-
-                    gradient_tensor = gradients
-
-                else:
-
-                    gradient_tensor = (
-                        gradients
-                        .permute(
-                            0,
-                            3,
-                            1,
-                            2,
-                        )
-                        .contiguous()
-                    )
-
-            elif gradients.ndim == 3:
-
-                batch_size, tokens, channels = (
-                    gradients.shape
-                )
-
-                side = int(
-                    np.sqrt(tokens)
                 )
 
                 gradient_tensor = (
                     gradients
-                    .transpose(
+                    .permute(
+                        0,
+                        3,
                         1,
                         2,
                     )
                     .contiguous()
-                    .view(
-                        batch_size,
-                        channels,
-                        side,
-                        side,
-                    )
                 )
 
             else:
 
-                raise RuntimeError(
-                    "Unsupported gradient shape: "
-                    f"{tuple(gradients.shape)}"
-                )
+                # Default to B,C,H,W
+                activation_tensor = activations
+                gradient_tensor = gradients
 
-            # ------------------------------------------------
-            # Global average pooling.
-            # ------------------------------------------------
+        else:
 
-            weights = gradient_tensor.mean(
-                dim=(2, 3),
-                keepdim=True,
+            raise RuntimeError(
+                "Grad-CAM target layer must produce "
+                "a 4D feature map. "
+                f"Received shape: {tuple(activations.shape)}"
             )
 
-            # ------------------------------------------------
-            # Weighted activation map.
-            # ------------------------------------------------
+        # ----------------------------------------------------
+        # Global average pooling of gradients
+        # ----------------------------------------------------
 
-            cam = (
-                weights * activation_tensor
-            ).sum(
-                dim=1,
-                keepdim=True,
-            )
-
-            # ReLU.
-            cam = F.relu(cam)
-
-            # ------------------------------------------------
-            # Resize CAM to input image dimensions.
-            # ------------------------------------------------
-
-            cam = F.interpolate(
-                cam,
-                size=(
-                    input_tensor.shape[-2],
-                    input_tensor.shape[-1],
-                ),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-            # Remove channel dimension.
-            cam = cam[:, 0]
-
-            # ------------------------------------------------
-            # Normalize CAM to [0, 1].
-            # ------------------------------------------------
-
-            cam_min = cam.amin(
-                dim=(1, 2),
-                keepdim=True,
-            )
-
-            cam_max = cam.amax(
-                dim=(1, 2),
-                keepdim=True,
-            )
-
-            cam = (
-                cam - cam_min
-            ) / (
-                cam_max
-                - cam_min
-                + 1e-8
-            )
-
-            return cam.detach()
-
-
-# ============================================================
-# IMAGE PREPROCESSING
-# ============================================================
-
-def preprocess_image(image):
-    """
-    Convert a PIL image into a model input tensor.
-    """
-
-    if image.mode != "RGB":
-
-        image = image.convert(
-            "RGB"
+        weights = gradient_tensor.mean(
+            dim=(2, 3),
+            keepdim=True,
         )
 
+        # ----------------------------------------------------
+        # Weighted feature maps
+        # ----------------------------------------------------
+
+        cam = (
+            weights
+            * activation_tensor
+        ).sum(
+            dim=1,
+            keepdim=True,
+        )
+
+        # ----------------------------------------------------
+        # ReLU
+        # ----------------------------------------------------
+
+        cam = F.relu(
+            cam
+        )
+
+        # ----------------------------------------------------
+        # Resize CAM
+        # ----------------------------------------------------
+
+        cam = F.interpolate(
+            cam,
+            size=(
+                IMAGE_SIZE,
+                IMAGE_SIZE,
+            ),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        cam = cam[
+            0,
+            0
+        ]
+
+        # ----------------------------------------------------
+        # Normalize 0-1
+        # ----------------------------------------------------
+
+        cam_min = cam.min()
+        cam_max = cam.max()
+
+        difference = (
+            cam_max
+            - cam_min
+        )
+
+        if float(
+            difference.detach().cpu()
+        ) > 1e-8:
+
+            cam = (
+                cam
+                - cam_min
+            ) / difference
+
+        else:
+
+            cam = torch.zeros_like(
+                cam
+            )
+
+        # ----------------------------------------------------
+        # Detach everything that is no longer needed
+        # ----------------------------------------------------
+
+        output_copy = logits.detach()
+
+        cam_copy = cam.detach()
+
+        self.activations = None
+
+        del output
+        del logits
+        del score
+        del gradients
+        del activation_tensor
+        del gradient_tensor
+        del weights
+        del cam
+
+        if torch.cuda.is_available():
+
+            torch.cuda.empty_cache()
+
+        return (
+            output_copy,
+            cam_copy,
+        )
+
+
+# ============================================================
+# IMAGE PREPARATION
+# ============================================================
+
+def prepare_image(
+    image,
+    image_size=IMAGE_SIZE,
+    device=None,
+):
+    """
+    Convert PIL image into model input tensor.
+    """
+
+    if image is None:
+
+        raise ValueError(
+            "Image cannot be None."
+        )
+
+    if not isinstance(
+        image,
+        Image.Image,
+    ):
+
+        raise TypeError(
+            "image must be a PIL.Image.Image."
+        )
+
+    if device is None:
+
+        device = DEVICE
+
     transform = build_transforms(
-        image_size=IMAGE_SIZE,
+        image_size=image_size,
         train=False,
     )
 
-    tensor = transform(
-        image
+    rgb_image = image.convert(
+        "RGB"
     )
 
-    tensor = tensor.unsqueeze(0)
+    input_tensor = transform(
+        rgb_image
+    )
 
-    return tensor.to(
-        DEVICE
+    input_tensor = input_tensor.unsqueeze(
+        0
+    )
+
+    input_tensor = input_tensor.to(
+        device
+    )
+
+    return (
+        rgb_image,
+        input_tensor,
     )
 
 
 # ============================================================
-# HEATMAP
+# HEATMAP COLORIZATION
 # ============================================================
 
-def create_heatmap(cam):
+def create_heatmap(
+    cam,
+):
     """
-    Convert normalized CAM into an RGB heatmap.
+    Convert normalized CAM [0,1] into RGB heatmap.
 
-    No Matplotlib is used.
+    This intentionally uses NumPy/PIL instead of Matplotlib,
+    keeping the API lightweight for Render.
     """
 
-    cam = np.asarray(
-        cam,
-        dtype=np.float32,
+    cam_array = (
+        cam.detach()
+        .cpu()
+        .numpy()
     )
 
-    cam = np.clip(
-        cam,
+    cam_array = np.clip(
+        cam_array,
         0.0,
         1.0,
     )
 
-    heatmap = np.zeros(
-        (
-            cam.shape[0],
-            cam.shape[1],
-            3,
-        ),
-        dtype=np.uint8,
+    # --------------------------------------------------------
+    # Simple blue -> cyan -> yellow -> red heatmap
+    # --------------------------------------------------------
+
+    red = np.clip(
+        2.0 * cam_array,
+        0.0,
+        1.0,
     )
 
-    # Red.
-    heatmap[:, :, 0] = (
-        np.clip(
-            255.0
-            * (
-                cam * 1.5
+    green = np.clip(
+        2.0
+        * (
+            1.0
+            - np.abs(
+                cam_array
                 - 0.5
-            ),
-            0,
-            255,
-        )
-    ).astype(
-        np.uint8
+            )
+            * 2.0
+        ),
+        0.0,
+        1.0,
     )
 
-    # Green.
-    heatmap[:, :, 1] = (
-        np.clip(
-            255.0
-            * (
-                cam * 1.5
-            ),
-            0,
-            255,
-        )
-    ).astype(
-        np.uint8
+    blue = np.clip(
+        2.0
+        * (
+            1.0
+            - cam_array
+        ),
+        0.0,
+        1.0,
     )
 
-    # Blue.
-    heatmap[:, :, 2] = (
-        np.clip(
-            255.0
-            * (
-                1.0
-                - cam * 1.5
-            ),
-            0,
-            255,
-        )
+    heatmap_array = np.stack(
+        [
+            red,
+            green,
+            blue,
+        ],
+        axis=-1,
+    )
+
+    heatmap_array = (
+        heatmap_array
+        * 255.0
     ).astype(
         np.uint8
     )
 
     return Image.fromarray(
-        heatmap,
+        heatmap_array,
         mode="RGB",
     )
 
 
 # ============================================================
-# VISUALIZATION
+# CREATE OVERLAY
 # ============================================================
 
-def create_visualization(
+def create_gradcam_overlay(
     original_image,
     cam,
     predicted_class,
     confidence,
 ):
     """
-    Create:
+    Create a lightweight 3-panel PNG:
 
-        Original | Heatmap | Overlay
+    1. Original image
+    2. Grad-CAM heatmap
+    3. Grad-CAM overlay
 
     Returns:
-        PIL.Image
+        PNG bytes
     """
 
     # --------------------------------------------------------
-    # Original image
+    # Resize original
     # --------------------------------------------------------
 
-    original = (
-        original_image
-        .convert("RGB")
-        .resize(
-            (
-                GRADCAM_IMAGE_SIZE,
-                GRADCAM_IMAGE_SIZE,
-            ),
-            Image.Resampling.BILINEAR,
-        )
-    )
-
-    # --------------------------------------------------------
-    # CAM grayscale
-    # --------------------------------------------------------
-
-    cam_image = Image.fromarray(
-        (
-            np.clip(
-                cam,
-                0.0,
-                1.0,
-            )
-            * 255
-        ).astype(
-            np.uint8
-        ),
-        mode="L",
-    )
-
-    cam_image = cam_image.resize(
+    original = original_image.convert(
+        "RGB"
+    ).resize(
         (
             GRADCAM_IMAGE_SIZE,
             GRADCAM_IMAGE_SIZE,
@@ -641,21 +931,18 @@ def create_visualization(
         Image.Resampling.BILINEAR,
     )
 
-    cam_array = (
-        np.asarray(
-            cam_image
-        ).astype(
-            np.float32
-        )
-        / 255.0
-    )
-
     # --------------------------------------------------------
-    # Heatmap
+    # Resize CAM
     # --------------------------------------------------------
 
-    heatmap = create_heatmap(
-        cam_array
+    cam_image = create_heatmap(
+        cam
+    ).resize(
+        (
+            GRADCAM_IMAGE_SIZE,
+            GRADCAM_IMAGE_SIZE,
+        ),
+        Image.Resampling.BILINEAR,
     )
 
     # --------------------------------------------------------
@@ -664,28 +951,26 @@ def create_visualization(
 
     overlay = Image.blend(
         original,
-        heatmap,
+        cam_image,
         alpha=0.45,
     )
 
     # --------------------------------------------------------
-    # Canvas
+    # Create canvas
+    #
+    # No Matplotlib.
     # --------------------------------------------------------
 
-    width = (
-        GRADCAM_IMAGE_SIZE
-        * 3
-    )
-
-    height = GRADCAM_IMAGE_SIZE
+    panel_width = GRADCAM_IMAGE_SIZE
+    panel_height = GRADCAM_IMAGE_SIZE
 
     canvas = Image.new(
         "RGB",
         (
-            width,
-            height,
+            panel_width * 3,
+            panel_height,
         ),
-        "black",
+        "white",
     )
 
     canvas.paste(
@@ -697,9 +982,9 @@ def create_visualization(
     )
 
     canvas.paste(
-        heatmap,
+        cam_image,
         (
-            GRADCAM_IMAGE_SIZE,
+            panel_width,
             0,
         ),
     )
@@ -707,12 +992,28 @@ def create_visualization(
     canvas.paste(
         overlay,
         (
-            GRADCAM_IMAGE_SIZE * 2,
+            panel_width * 2,
             0,
         ),
     )
 
-    return canvas
+    # --------------------------------------------------------
+    # Save PNG in memory
+    # --------------------------------------------------------
+
+    image_buffer = io.BytesIO()
+
+    canvas.save(
+        image_buffer,
+        format="PNG",
+        optimize=True,
+    )
+
+    image_buffer.seek(
+        0
+    )
+
+    return image_buffer.getvalue()
 
 
 # ============================================================
@@ -722,430 +1023,237 @@ def create_visualization(
 def generate_gradcam_for_api(
     model,
     image,
+    predicted_index=None,
     predicted_class=None,
     confidence=0.0,
-    predicted_index=None,
 ):
     """
-    Generate Grad-CAM PNG bytes for FastAPI.
+    Generate Grad-CAM for the FastAPI /explain endpoint.
 
-    Supports both:
+    IMPORTANT:
+    FastAPI passes both:
 
-        predicted_class=
-        predicted_index=
+        predicted_index=<integer>
+        predicted_class=<string>
 
-    This keeps compatibility with the existing
-    api.main.py implementation.
+    Example:
+
+        predicted_index=1
+        predicted_class="Cyst"
+
+    The function safely resolves the integer index.
+
+    Returns:
+        PNG image bytes.
     """
 
-    # --------------------------------------------------------
-    # Backward compatibility.
-    # --------------------------------------------------------
+    if model is None:
 
-    if predicted_class is None:
+        raise ValueError(
+            "Model cannot be None."
+        )
 
-        if predicted_index is None:
+    if image is None:
 
-            raise ValueError(
-                "Either predicted_class or "
-                "predicted_index must be provided."
-            )
-
-        predicted_class = predicted_index
-
-    predicted_class = int(
-        predicted_class
-    )
-
-    # --------------------------------------------------------
-    # Validate class index.
-    # --------------------------------------------------------
-
-    if predicted_class < 0:
-
-        predicted_class = 0
-
-    if predicted_class >= len(
-        CLASS_NAMES
-    ):
-
-        predicted_class = (
-            len(CLASS_NAMES)
-            - 1
+        raise ValueError(
+            "Image cannot be None."
         )
 
     # --------------------------------------------------------
-    # Validate image.
+    # Resolve class index
     # --------------------------------------------------------
 
-    if not isinstance(
-        image,
-        Image.Image,
-    ):
+    class_index = normalize_class_index(
+        predicted_index=predicted_index,
+        predicted_class=predicted_class,
+    )
 
-        raise TypeError(
-            "image must be a PIL.Image.Image"
+    # --------------------------------------------------------
+    # Resolve class name
+    # --------------------------------------------------------
+
+    resolved_class = CLASS_NAMES[
+        class_index
+    ]
+
+    # --------------------------------------------------------
+    # Use model's actual device
+    # --------------------------------------------------------
+
+    try:
+
+        model_device = next(
+            model.parameters()
+        ).device
+
+    except StopIteration:
+
+        model_device = DEVICE
+
+    # --------------------------------------------------------
+    # Prepare image
+    # --------------------------------------------------------
+
+    original_image, input_tensor = (
+        prepare_image(
+            image=image,
+            image_size=IMAGE_SIZE,
+            device=model_device,
         )
-
-    original_image = image.convert(
-        "RGB"
     )
 
     # --------------------------------------------------------
-    # Prepare tensor.
-    # --------------------------------------------------------
-
-    input_tensor = preprocess_image(
-        original_image
-    )
-
-    # --------------------------------------------------------
-    # Model.
-    # --------------------------------------------------------
-
-    model.eval()
-
-    # --------------------------------------------------------
-    # Target layer.
+    # Target layer
     # --------------------------------------------------------
 
     target_layer = get_target_layer(
         model
     )
 
-    print(
-        "Grad-CAM target layer:",
-        target_layer.__class__.__name__,
-    )
-
     # --------------------------------------------------------
-    # Grad-CAM engine.
+    # Generate CAM
     # --------------------------------------------------------
-
-    cam_engine = GradCAM(
-        model=model,
-        target_layer=target_layer,
-    )
 
     try:
 
-        cam = cam_engine.generate(
-            input_tensor=input_tensor,
-            target_class=predicted_class,
-        )
+        with GradCAM(
+            model=model,
+            target_layer=target_layer,
+        ) as gradcam:
 
-        cam = (
-            cam[0]
-            .cpu()
-            .numpy()
-        )
+            with torch.enable_grad():
 
-        # ----------------------------------------------------
-        # Visualization.
-        # ----------------------------------------------------
-
-        visualization = create_visualization(
-            original_image=original_image,
-            cam=cam,
-            predicted_class=predicted_class,
-            confidence=confidence,
-        )
-
-        # ----------------------------------------------------
-        # PNG bytes.
-        # ----------------------------------------------------
-
-        output = io.BytesIO()
-
-        visualization.save(
-            output,
-            format="PNG",
-            optimize=True,
-        )
-
-        output.seek(0)
-
-        return output.getvalue()
+                _, cam = gradcam.generate(
+                    input_tensor=input_tensor,
+                    class_index=class_index,
+                )
 
     finally:
 
-        # Remove forward hook immediately.
-        cam_engine.remove()
+        # ----------------------------------------------------
+        # Release input tensor
+        # ----------------------------------------------------
 
-        cam_engine.activations = None
-
-        # Release input tensor.
         del input_tensor
 
-        # CUDA cleanup if applicable.
         if torch.cuda.is_available():
 
             torch.cuda.empty_cache()
 
+    # --------------------------------------------------------
+    # Create PNG
+    # --------------------------------------------------------
 
-# ============================================================
-# LOCAL SWIN CHECKPOINT
-# ============================================================
-
-def load_local_swin_model():
-    """
-    Load the locally trained SwinTransformer checkpoint.
-
-    Used only by the local CLI.
-
-    FastAPI does NOT use this function.
-    """
-
-    if not CHECKPOINT_PATH.exists():
-
-        raise FileNotFoundError(
-            f"Checkpoint not found: "
-            f"{CHECKPOINT_PATH}"
-        )
-
-    model = create_model(
-        model_name="SwinTransformer",
-        num_classes=len(
-            CLASS_NAMES
+    png_bytes = create_gradcam_overlay(
+        original_image=original_image,
+        cam=cam,
+        predicted_class=resolved_class,
+        confidence=float(
+            confidence
         ),
-        pretrained=False,
-    )
-
-    checkpoint = torch.load(
-        CHECKPOINT_PATH,
-        map_location=DEVICE,
-        weights_only=False,
     )
 
     # --------------------------------------------------------
-    # Training checkpoint.
+    # Release CAM
     # --------------------------------------------------------
 
-    if isinstance(
-        checkpoint,
-        dict,
-    ):
+    del cam
 
-        state_dict = checkpoint.get(
-            "model_state_dict"
+    if torch.cuda.is_available():
+
+        torch.cuda.empty_cache()
+
+    return png_bytes
+
+
+# ============================================================
+# LOCAL MODEL LOADER
+# ============================================================
+
+def load_local_deployment_model():
+    """
+    Load the bundled deployment model.
+
+    This is only used when running this file directly.
+
+    The FastAPI application has its own model loader.
+    """
+
+    deployment_model = (
+        PROJECT_ROOT
+        / "artifacts"
+        / "deployment_model"
+        / "data"
+        / "model.pth"
+    )
+
+    if deployment_model.exists():
+
+        print(
+            f"Loading deployment model:\n"
+            f"{deployment_model}"
         )
 
-        if state_dict is None:
+        model = torch.load(
+            deployment_model,
+            map_location=DEVICE,
+            weights_only=False,
+        )
+
+        if not isinstance(
+            model,
+            torch.nn.Module,
+        ):
 
             raise RuntimeError(
-                "Checkpoint does not contain "
-                "'model_state_dict'."
+                "Deployment file does not contain "
+                "a torch.nn.Module."
             )
 
-        model.load_state_dict(
-            state_dict
+        model.to(
+            DEVICE
         )
 
-    # --------------------------------------------------------
-    # Complete model object.
-    # --------------------------------------------------------
+        model.eval()
 
-    elif isinstance(
-        checkpoint,
-        torch.nn.Module,
-    ):
+        return model
 
-        model = checkpoint
-
-    else:
-
-        raise RuntimeError(
-            "Unsupported checkpoint format."
-        )
-
-    model.to(
-        DEVICE
+    raise FileNotFoundError(
+        "Deployment model not found:\n"
+        f"{deployment_model}"
     )
 
-    model.eval()
-
-    return model
-
 
 # ============================================================
-# LOCAL GRAD-CAM
+# LOCAL TEST
 # ============================================================
 
-def run_local_gradcam(
-    image_path,
-    output_path,
-):
+def main():
     """
-    Run Grad-CAM locally using the SwinTransformer
-    checkpoint.
+    Local Grad-CAM smoke test.
+
+    Uses the deployment model if available.
     """
 
-    image_path = Path(
-        image_path
-    )
-
-    output_path = Path(
-        output_path
-    )
-
-    if not image_path.exists():
-
-        raise FileNotFoundError(
-            f"Image not found: "
-            f"{image_path}"
-        )
-
-    print("=" * 70)
     print(
-        "GRAD-CAM EXPLAINABILITY"
-    )
-    print("=" * 70)
-
-    print(
-        "Checkpoint:",
-        CHECKPOINT_PATH,
+        "=" * 70
     )
 
     print(
-        "Image:",
-        image_path,
+        "STEP 12 - GRAD-CAM EXPLAINABILITY"
     )
 
     print(
-        "Device:",
-        DEVICE,
+        "=" * 70
     )
+
+    print()
 
     # --------------------------------------------------------
-    # Load image.
+    # Find sample image
     # --------------------------------------------------------
 
-    image = Image.open(
-        image_path
-    ).convert(
-        "RGB"
-    )
-
-    # --------------------------------------------------------
-    # Load model.
-    # --------------------------------------------------------
-
-    print(
-        "Loading local SwinTransformer model..."
-    )
-
-    model = load_local_swin_model()
-
-    print(
-        "Model loaded:",
-        model.__class__.__name__,
-    )
-
-    # --------------------------------------------------------
-    # Prediction.
-    # --------------------------------------------------------
-
-    input_tensor = preprocess_image(
-        image
-    )
-
-    with torch.no_grad():
-
-        output = model(
-            input_tensor
-        )
-
-        if hasattr(
-            output,
-            "logits",
-        ):
-
-            logits = output.logits
-
-        elif isinstance(
-            output,
-            tuple,
-        ):
-
-            logits = output[0]
-
-        else:
-
-            logits = output
-
-        probabilities = torch.softmax(
-            logits,
-            dim=1,
-        )
-
-        predicted_class = int(
-            probabilities.argmax(
-                dim=1
-            ).item()
-        )
-
-        confidence = float(
-            probabilities[
-                0,
-                predicted_class,
-            ].item()
-        )
-
-    del input_tensor
-
-    print(
-        "Predicted class:",
-        CLASS_NAMES[
-            predicted_class
-        ],
-    )
-
-    print(
-        "Confidence:",
-        f"{confidence:.4f}",
-    )
-
-    # --------------------------------------------------------
-    # Grad-CAM.
-    # --------------------------------------------------------
-
-    result = generate_gradcam_for_api(
-        model=model,
-        image=image,
-        predicted_class=predicted_class,
-        confidence=confidence,
-    )
-
-    # --------------------------------------------------------
-    # Save.
-    # --------------------------------------------------------
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    output_path.write_bytes(
-        result
-    )
-
-    print(
-        "Grad-CAM saved:",
-        output_path,
-    )
-
-    print(
-        "GRAD-CAM COMPLETE"
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == "__main__":
-
-    default_image = (
+    image_path = (
         PROJECT_ROOT
         / "data"
         / "raw"
@@ -1155,15 +1263,164 @@ if __name__ == "__main__":
         / "Cyst- (70).jpg"
     )
 
-    default_output = (
-        PROJECT_ROOT
-        / "artifacts"
-        / "explainability"
-        / "gradcam"
+    if not image_path.exists():
+
+        raise FileNotFoundError(
+            f"Sample image not found:\n"
+            f"{image_path}"
+        )
+
+    print(
+        f"Image      : {image_path}"
+    )
+
+    # --------------------------------------------------------
+    # Load model
+    # --------------------------------------------------------
+
+    model = load_local_deployment_model()
+
+    print(
+        f"Model type : {model.__class__.__name__}"
+    )
+
+    print(
+        f"Device     : {DEVICE}"
+    )
+
+    # --------------------------------------------------------
+    # Load image
+    # --------------------------------------------------------
+
+    image = Image.open(
+        image_path
+    ).convert(
+        "RGB"
+    )
+
+    # --------------------------------------------------------
+    # Prepare image
+    # --------------------------------------------------------
+
+    original_image, input_tensor = (
+        prepare_image(
+            image=image,
+            image_size=IMAGE_SIZE,
+            device=DEVICE,
+        )
+    )
+
+    print(
+        f"Input tensor shape: "
+        f"{tuple(input_tensor.shape)}"
+    )
+
+    # --------------------------------------------------------
+    # Prediction
+    # --------------------------------------------------------
+
+    model.eval()
+
+    with torch.no_grad():
+
+        output = model(
+            input_tensor
+        )
+
+        logits = extract_logits(
+            output
+        )
+
+        probabilities = torch.softmax(
+            logits,
+            dim=1,
+        )
+
+        confidence_tensor, predicted_index_tensor = (
+            torch.max(
+                probabilities,
+                dim=1,
+            )
+        )
+
+        predicted_index = int(
+            predicted_index_tensor.item()
+        )
+
+        confidence = float(
+            confidence_tensor.item()
+        )
+
+    predicted_class = CLASS_NAMES[
+        predicted_index
+    ]
+
+    print(
+        f"Predicted class : "
+        f"{predicted_class}"
+    )
+
+    print(
+        f"Confidence      : "
+        f"{confidence:.4f}"
+    )
+
+    # --------------------------------------------------------
+    # Grad-CAM
+    # --------------------------------------------------------
+
+    png_bytes = generate_gradcam_for_api(
+        model=model,
+        image=original_image,
+        predicted_index=predicted_index,
+        predicted_class=predicted_class,
+        confidence=confidence,
+    )
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
+    output_path = (
+        OUTPUT_DIR
         / "gradcam_example.png"
     )
 
-    run_local_gradcam(
-        image_path=default_image,
-        output_path=default_output,
+    output_path.write_bytes(
+        png_bytes
     )
+
+    print()
+
+    print(
+        f"Grad-CAM saved  : "
+        f"{output_path}"
+    )
+
+    print(
+        f"File size       : "
+        f"{len(png_bytes):,} bytes"
+    )
+
+    print()
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "GRAD-CAM COMPLETE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
