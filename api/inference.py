@@ -43,9 +43,11 @@ MODEL_FILE = (
 # MODEL CONFIGURATION
 # ============================================================
 
-MODEL_NAME = "SwinTransformer"
+MODEL_NAME = "EfficientNet-B0"
 
-REGISTERED_MODEL_NAME = "KidneyVision-SwinTransformer"
+REGISTERED_MODEL_NAME = (
+    "KidneyVision-EfficientNet-B0"
+)
 
 MODEL_ALIAS = "champion"
 
@@ -59,12 +61,12 @@ IMAGE_SIZE = 224
 # ============================================================
 
 # local:
-#   Load the bundled PyTorch model.pth
+#   Load artifacts/deployment_model/data/model.pth
 #
 # registry:
-#   Load the model from MLflow Model Registry
+#   Load model from MLflow Model Registry
 #
-# Render/Docker deployment uses:
+# Render deployment uses:
 #   MODEL_SOURCE=local
 
 MODEL_SOURCE = os.getenv(
@@ -80,6 +82,31 @@ MODEL_SOURCE = os.getenv(
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
+
+# ============================================================
+# CPU MEMORY CONFIGURATION
+# ============================================================
+
+# Render Free has limited memory.
+#
+# Restricting PyTorch CPU parallelism reduces the number
+# of temporary worker/thread buffers created during inference
+# and Grad-CAM.
+
+if DEVICE.type == "cpu":
+
+    torch.set_num_threads(1)
+
+    try:
+
+        torch.set_num_interop_threads(1)
+
+    except RuntimeError:
+
+        # PyTorch may reject this if parallel work has
+        # already started. Continuing is safe.
+        pass
 
 
 # ============================================================
@@ -123,16 +150,6 @@ def load_model():
 
     Returns:
         torch.nn.Module
-
-    Raises:
-        FileNotFoundError:
-            If the local model file is missing.
-
-        RuntimeError:
-            If model loading fails.
-
-        ValueError:
-            If MODEL_SOURCE is invalid.
     """
 
     # ========================================================
@@ -164,7 +181,8 @@ def load_model():
         except Exception as exc:
 
             raise RuntimeError(
-                "Failed to load local PyTorch deployment model."
+                "Failed to load local PyTorch "
+                "deployment model."
             ) from exc
 
     # ========================================================
@@ -197,18 +215,19 @@ def load_model():
         except Exception as exc:
 
             raise RuntimeError(
-                "Failed to load model from MLflow Registry."
+                "Failed to load model from "
+                "MLflow Registry."
             ) from exc
 
     # ========================================================
-    # INVALID SOURCE
+    # INVALID MODEL SOURCE
     # ========================================================
 
     else:
 
         raise ValueError(
             "Invalid MODEL_SOURCE. "
-            f"Expected 'local' or 'registry', "
+            "Expected 'local' or 'registry', "
             f"got '{MODEL_SOURCE}'."
         )
 
@@ -222,12 +241,19 @@ def load_model():
             "Model loader returned None."
         )
 
-    if not isinstance(model, torch.nn.Module):
+    if not isinstance(
+        model,
+        torch.nn.Module
+    ):
 
         raise TypeError(
             "Loaded object is not a PyTorch model. "
             f"Got: {type(model)}"
         )
+
+    # ========================================================
+    # MOVE MODEL TO DEVICE
+    # ========================================================
 
     model = model.to(DEVICE)
 
@@ -243,6 +269,18 @@ def load_model():
         DEVICE
     )
 
+    logger.info(
+        "PyTorch CPU threads: %s",
+        torch.get_num_threads()
+    )
+
+    if DEVICE.type == "cpu":
+
+        logger.info(
+            "PyTorch inter-op threads: %s",
+            torch.get_num_interop_threads()
+        )
+
     return model
 
 
@@ -252,22 +290,33 @@ def load_model():
 
 def get_model():
     """
-    Return the cached model.
+    Return the cached production model.
 
-    The model is loaded lazily on the first inference request.
-    Thread-safe so multiple API requests cannot initialize
+    The model is loaded lazily on the first request.
+
+    Thread-safe so multiple requests cannot initialize
     the model simultaneously.
     """
 
     global MODEL
     global MODEL_LOAD_ERROR
 
+    # --------------------------------------------------------
+    # Already loaded
+    # --------------------------------------------------------
+
     if MODEL is not None:
+
         return MODEL
+
+    # --------------------------------------------------------
+    # Thread-safe initialization
+    # --------------------------------------------------------
 
     with MODEL_LOAD_LOCK:
 
         if MODEL is not None:
+
             return MODEL
 
         try:
@@ -297,7 +346,7 @@ def get_model():
 
 def is_model_loaded() -> bool:
     """
-    Return True when the model has been loaded successfully.
+    Return True when the model has been loaded.
     """
 
     return MODEL is not None
@@ -315,7 +364,9 @@ def get_model_load_error():
 # IMAGE VALIDATION
 # ============================================================
 
-def validate_image(image: Image.Image):
+def validate_image(
+    image: Image.Image
+):
     """
     Validate uploaded image before inference.
     """
@@ -326,7 +377,10 @@ def validate_image(image: Image.Image):
             "Image cannot be None."
         )
 
-    if not isinstance(image, Image.Image):
+    if not isinstance(
+        image,
+        Image.Image
+    ):
 
         raise TypeError(
             "Input must be a PIL Image."
@@ -335,7 +389,8 @@ def validate_image(image: Image.Image):
     if image.width <= 0 or image.height <= 0:
 
         raise ValueError(
-            "Image dimensions must be greater than zero."
+            "Image dimensions must be "
+            "greater than zero."
         )
 
 
@@ -343,9 +398,11 @@ def validate_image(image: Image.Image):
 # PREDICTION
 # ============================================================
 
-def predict_image(image: Image.Image) -> Dict:
+def predict_image(
+    image: Image.Image
+) -> Dict:
     """
-    Run image classification.
+    Run EfficientNet-B0 image classification.
 
     Args:
         image:
@@ -360,18 +417,26 @@ def predict_image(image: Image.Image) -> Dict:
         probabilities
     """
 
+    # --------------------------------------------------------
+    # Validate
+    # --------------------------------------------------------
+
     validate_image(image)
+
+    # --------------------------------------------------------
+    # Load model
+    # --------------------------------------------------------
 
     model = get_model()
 
     # --------------------------------------------------------
-    # Convert image to RGB
+    # Convert to RGB
     # --------------------------------------------------------
 
     image = image.convert("RGB")
 
     # --------------------------------------------------------
-    # Apply inference preprocessing
+    # Preprocessing
     # --------------------------------------------------------
 
     try:
@@ -384,10 +449,14 @@ def predict_image(image: Image.Image) -> Dict:
             "Failed to preprocess input image."
         ) from exc
 
-    if not isinstance(input_tensor, torch.Tensor):
+    if not isinstance(
+        input_tensor,
+        torch.Tensor
+    ):
 
         raise TypeError(
-            "Image transform did not return a torch.Tensor."
+            "Image transform did not return "
+            "a torch.Tensor."
         )
 
     # --------------------------------------------------------
@@ -418,15 +487,25 @@ def predict_image(image: Image.Image) -> Dict:
     # Handle model output
     # --------------------------------------------------------
 
-    if hasattr(output, "logits"):
+    if hasattr(
+        output,
+        "logits"
+    ):
 
         output = output.logits
 
-    if not isinstance(output, torch.Tensor):
+    if not isinstance(
+        output,
+        torch.Tensor
+    ):
 
         raise TypeError(
             "Model output is not a torch.Tensor."
         )
+
+    # --------------------------------------------------------
+    # Validate output shape
+    # --------------------------------------------------------
 
     if output.ndim != 2:
 
@@ -450,13 +529,17 @@ def predict_image(image: Image.Image) -> Dict:
         )
 
     # --------------------------------------------------------
-    # Probabilities
+    # Softmax probabilities
     # --------------------------------------------------------
 
     probabilities_tensor = F.softmax(
         output,
         dim=1
     )[0]
+
+    # --------------------------------------------------------
+    # Predicted class
+    # --------------------------------------------------------
 
     predicted_index = int(
         torch.argmax(
@@ -465,7 +548,9 @@ def predict_image(image: Image.Image) -> Dict:
     )
 
     confidence = float(
-        probabilities_tensor[predicted_index].item()
+        probabilities_tensor[
+            predicted_index
+        ].item()
     )
 
     # --------------------------------------------------------
@@ -474,7 +559,9 @@ def predict_image(image: Image.Image) -> Dict:
 
     probabilities = {}
 
-    for index, class_name in enumerate(CLASS_NAMES):
+    for index, class_name in enumerate(
+        CLASS_NAMES
+    ):
 
         probabilities[class_name] = float(
             probabilities_tensor[index].item()
@@ -485,7 +572,9 @@ def predict_image(image: Image.Image) -> Dict:
     # --------------------------------------------------------
 
     result = {
-        "prediction": CLASS_NAMES[predicted_index],
+        "prediction": CLASS_NAMES[
+            predicted_index
+        ],
         "confidence": confidence,
         "confidence_percent": round(
             confidence * 100,
@@ -509,7 +598,7 @@ def predict_image(image: Image.Image) -> Dict:
 
 def get_model_info() -> Dict:
     """
-    Return model/deployment information for the API.
+    Return model/deployment information.
     """
 
     return {
@@ -520,6 +609,16 @@ def get_model_info() -> Dict:
         "classes": CLASS_NAMES,
         "image_size": IMAGE_SIZE,
         "device": str(DEVICE),
+        "cpu_threads": (
+            torch.get_num_threads()
+            if DEVICE.type == "cpu"
+            else None
+        ),
+        "cpu_interop_threads": (
+            torch.get_num_interop_threads()
+            if DEVICE.type == "cpu"
+            else None
+        ),
         "status": (
             "loaded"
             if is_model_loaded()
