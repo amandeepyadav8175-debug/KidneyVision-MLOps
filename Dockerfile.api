@@ -2,36 +2,58 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+# ============================================================
+# PYTHON CONFIGURATION
+# ============================================================
+
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV MODEL_SOURCE=local
 
-# Install API dependencies
+# ============================================================
+# INSTALL API DEPENDENCIES
+# ============================================================
+
 COPY requirements-api.txt .
 
 RUN pip install --no-cache-dir -r requirements-api.txt
 
-# Copy application code
+# ============================================================
+# COPY APPLICATION
+# ============================================================
+
 COPY api ./api
 COPY src ./src
 COPY configs ./configs
 
-# Download the production EfficientNet model
+# ============================================================
+# DOWNLOAD DEPLOYMENT MODEL
+# ============================================================
+
 ARG MODEL_CACHE_BUST=2
 
 RUN mkdir -p /app/artifacts/deployment_model/data && \
     python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/amandeepyadav8175-debug/KidneyVision-MLOps/releases/download/v1.0.0/model.pth?cache=${MODEL_CACHE_BUST}', '/app/artifacts/deployment_model/data/model.pth')"
 
-# Create non-root user
+# ============================================================
+# CREATE NON-ROOT USER
+# ============================================================
+
 RUN useradd --create-home --shell /bin/bash appuser && \
     chown -R appuser:appuser /app
 
 USER appuser
 
+# ============================================================
+# RENDER PORT
+# ============================================================
+
 EXPOSE 10000
 
-# Render provides PORT at runtime.
-# Local Docker defaults to 10000 if PORT is not set.
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 HEALTHCHECK \
     --interval=30s \
     --timeout=5s \
@@ -39,4 +61,8 @@ HEALTHCHECK \
     --retries=3 \
     CMD sh -c "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:${PORT:-10000}/health', timeout=3)\""
 
-CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# ============================================================
+# START FASTAPI
+# ============================================================
+
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT}"]
