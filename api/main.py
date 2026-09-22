@@ -1,293 +1,162 @@
+from __future__ import annotations
+
 import io
-import logging
-import os
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import Response
-from PIL import Image, UnidentifiedImageError
+from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
 
-from api.inference import (
-    get_model,
-    get_model_info,
-    is_model_loaded,
-    predict_image,
-)
-
-from configs.training_config import CLASS_NAMES
+from api.inference import get_model_info, load_model, predict_image
 from src.explainability.occlusion import generate_occlusion_for_api
+from src.explainability.gradcam_render import generate_gradcam_for_api
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# APPLICATION
-# ============================================================
 
 app = FastAPI(
-    title="KidneyVision API",
-    description="Kidney CT image classification API",
+    title="KidneyVision AI API",
+    description="Kidney CT image classification API with explainability.",
     version="1.0.0",
 )
 
 
 # ============================================================
-# CONFIGURATION
-# ============================================================
-
-MAX_IMAGE_SIZE_MB = 10
-MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024
-
-
-# ============================================================
-# HELPER: READ UPLOADED IMAGE
-# ============================================================
-
-async def read_uploaded_image(file: UploadFile) -> Image.Image:
-    """
-    Validate and safely convert an uploaded file into a PIL image.
-    """
-
-    if not file.content_type:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing file content type.",
-        )
-
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only image files are allowed.",
-        )
-
-    contents = await file.read()
-
-    if not contents:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty.",
-        )
-
-    if len(contents) > MAX_IMAGE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Image file is too large. "
-                f"Maximum allowed size is {MAX_IMAGE_SIZE_MB} MB."
-            ),
-        )
-
-    try:
-        image = Image.open(io.BytesIO(contents))
-
-        # Force image decoding so corrupt images are detected.
-        image.load()
-
-        return image.convert("RGB")
-
-    except (UnidentifiedImageError, OSError) as exc:
-        logger.warning(
-            "Invalid image upload: %s",
-            exc,
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is not a valid image.",
-        ) from exc
-
-
-# ============================================================
-# ROOT ENDPOINT
-# ============================================================
-
-@app.get("/")
-def root():
-
-    return {
-        "message": "KidneyVision API is running",
-        "docs": "/docs",
-    }
-
-
-# ============================================================
-# HEALTH ENDPOINT
+# HEALTH
 # ============================================================
 
 @app.get("/health")
 def health():
-
     return {
         "status": "healthy",
-        "model_loaded": is_model_loaded(),
+        "service": "KidneyVision AI API",
     }
 
 
 # ============================================================
-# READINESS ENDPOINT
+# ROOT
 # ============================================================
 
-@app.get("/ready")
-def readiness():
-    """
-    Readiness endpoint.
-
-    /health answers:
-        Is the API process alive?
-
-    /ready answers:
-        Is the model loaded and ready to serve predictions?
-    """
-
-    if not is_model_loaded():
-
-        return {
-            "status": "not_ready",
-            "model_loaded": False,
-        }
-
+@app.get("/")
+def root():
     return {
-        "status": "ready",
-        "model_loaded": True,
+        "service": "KidneyVision AI API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": [
+            "GET /health",
+            "GET /model-info",
+            "POST /predict",
+            "POST /explain",
+            "POST /explain-gradcam",
+        ],
     }
 
 
 # ============================================================
-# MODEL INFORMATION
+# MODEL INFO
 # ============================================================
 
 @app.get("/model-info")
 def model_info():
-
     try:
-
         return get_model_info()
 
     except Exception as exc:
-
-        logger.exception(
-            "Failed to retrieve model information."
-        )
-
         raise HTTPException(
-            status_code=503,
-            detail="Model information is currently unavailable.",
-        ) from exc
+            status_code=500,
+            detail=f"Failed to get model information: {exc}",
+        )
 
 
 # ============================================================
-# PREDICTION ENDPOINT
+# PREDICTION
 # ============================================================
 
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(...),
-):
+async def predict(file: UploadFile = File(...)):
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a valid image file.",
+        )
 
     try:
+        contents = await file.read()
 
-        image = await read_uploaded_image(file)
+        image = Image.open(
+            io.BytesIO(contents)
+        ).convert("RGB")
 
         result = predict_image(image)
 
-        logger.info(
-            "Prediction completed: %s (%.2f%%)",
-            result["prediction"],
-            result["confidence_percent"],
+        return JSONResponse(
+            content=result
         )
-
-        return result
-
-    except HTTPException:
-        raise
 
     except Exception as exc:
 
-        logger.exception(
-            "Prediction failed."
+        print(
+            f"Prediction error: {exc}"
         )
 
         raise HTTPException(
-            status_code=503,
-            detail="Prediction service is currently unavailable.",
-        ) from exc
+            status_code=500,
+            detail=f"Prediction failed: {exc}",
+        )
 
 
 # ============================================================
-# EXPLAINABILITY ENDPOINT
+# OCCLUSION EXPLANATION
 # ============================================================
 
 @app.post("/explain")
-async def explain(
-    file: UploadFile = File(...),
-):
+async def explain(file: UploadFile = File(...)):
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a valid image file.",
+        )
 
     try:
 
-        image = await read_uploaded_image(file)
+        contents = await file.read()
 
-        # --------------------------------------------------------
-        # Get prediction first
-        # --------------------------------------------------------
+        image = Image.open(
+            io.BytesIO(contents)
+        ).convert("RGB")
 
-        prediction_result = predict_image(image)
+        # load_model() returns ONLY the model
+        model = load_model()
 
-        predicted_class = prediction_result["prediction"]
-        confidence = prediction_result["confidence"]
+        prediction_result = predict_image(
+            image
+        )
 
-        # --------------------------------------------------------
-        # Get predicted class index
-        # --------------------------------------------------------
+        predicted_class = prediction_result[
+            "prediction"
+        ]
 
-        try:
+        confidence = float(
+            prediction_result["confidence"]
+        )
 
-            predicted_index = CLASS_NAMES.index(
-                predicted_class
-            )
+        class_names = [
+            "Normal",
+            "Cyst",
+            "Stone",
+            "Tumor",
+        ]
 
-        except ValueError as exc:
+        predicted_index = class_names.index(
+            predicted_class
+        )
 
-            raise RuntimeError(
-                f"Unknown predicted class: {predicted_class}"
-            ) from exc
+        # Get device from model
+        device = next(
+            model.parameters()
+        ).device
 
-        # --------------------------------------------------------
-        # Load model
-        # --------------------------------------------------------
-
-        model = get_model()
-
-        # --------------------------------------------------------
-        # Determine model device
-        # --------------------------------------------------------
-
-        try:
-
-            device = next(model.parameters()).device
-
-        except StopIteration as exc:
-
-            raise RuntimeError(
-                "Unable to determine model device."
-            ) from exc
-
-        # --------------------------------------------------------
-        # Generate gradient-free occlusion explanation
-        #
-        # This intentionally replaces Grad-CAM for the API
-        # because Render Free has a strict memory limit.
-        # --------------------------------------------------------
-
-        explanation_bytes = generate_occlusion_for_api(
+        explanation = generate_occlusion_for_api(
             model=model,
             image=image,
             device=device,
@@ -296,33 +165,183 @@ async def explain(
             confidence=confidence,
         )
 
-        logger.info(
-            "Occlusion explanation generated for prediction: %s",
-            predicted_class,
-        )
-
-        return Response(
-            content=explanation_bytes,
+        return StreamingResponse(
+            io.BytesIO(explanation),
             media_type="image/png",
             headers={
                 "X-Predicted-Class": predicted_class,
-                "X-Confidence": str(confidence),
+                "X-Confidence": f"{confidence:.6f}",
                 "X-Explainability": "occlusion-sensitivity",
             },
         )
 
-    except HTTPException:
-        raise
-
     except Exception as exc:
 
-        logger.exception(
-            "Explainability generation failed."
+        print(
+            f"Occlusion explanation error: {exc}"
         )
 
         raise HTTPException(
-            status_code=503,
-            detail=(
-                "Explainability service is currently unavailable."
-            ),
-        ) from exc
+            status_code=500,
+            detail=f"Explanation failed: {exc}",
+        )
+
+
+# ============================================================
+# GRAD-CAM EXPLANATION
+# ============================================================
+
+@app.post("/explain-gradcam")
+async def explain_gradcam(
+    file: UploadFile = File(...)
+):
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a valid image file.",
+        )
+
+    try:
+
+        # ----------------------------------------------------
+        # READ IMAGE
+        # ----------------------------------------------------
+
+        contents = await file.read()
+
+        image = Image.open(
+            io.BytesIO(contents)
+        ).convert("RGB")
+
+        # ----------------------------------------------------
+        # LOAD MODEL
+        # ----------------------------------------------------
+
+        # IMPORTANT:
+        # load_model() returns ONLY the model.
+        model = load_model()
+
+        # ----------------------------------------------------
+        # PREDICTION
+        # ----------------------------------------------------
+
+        prediction_result = predict_image(
+            image
+        )
+
+        predicted_class = prediction_result[
+            "prediction"
+        ]
+
+        confidence = float(
+            prediction_result["confidence"]
+        )
+
+        class_names = [
+            "Normal",
+            "Cyst",
+            "Stone",
+            "Tumor",
+        ]
+
+        predicted_index = class_names.index(
+            predicted_class
+        )
+
+        print(
+            f"Grad-CAM prediction: "
+            f"{predicted_class} | "
+            f"Confidence: {confidence:.4f}"
+        )
+
+        # ----------------------------------------------------
+        # DEVICE
+        # ----------------------------------------------------
+
+        # Grad-CAM function expects device separately.
+        device = next(
+            model.parameters()
+        ).device
+
+        # ----------------------------------------------------
+        # GENERATE GRAD-CAM
+        # ----------------------------------------------------
+
+        explanation = generate_gradcam_for_api(
+            model=model,
+            image=image,
+            device=device,
+            predicted_index=predicted_index,
+            predicted_class=predicted_class,
+            confidence=confidence,
+        )
+
+        print(
+            "Grad-CAM generated successfully."
+        )
+
+        # ----------------------------------------------------
+        # RETURN PNG
+        # ----------------------------------------------------
+
+        return StreamingResponse(
+            io.BytesIO(explanation),
+            media_type="image/png",
+            headers={
+                "X-Predicted-Class": predicted_class,
+                "X-Confidence": f"{confidence:.6f}",
+                "X-Explainability": "grad-cam",
+            },
+        )
+
+    except Exception as exc:
+
+        print(
+            f"Grad-CAM error: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Grad-CAM generation failed: {exc}",
+        )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    print("=" * 50)
+
+    print(
+        "KidneyVision AI API starting..."
+    )
+
+    print(
+        "Endpoints:"
+    )
+
+    print(
+        "  GET  /health"
+    )
+
+    print(
+        "  GET  /model-info"
+    )
+
+    print(
+        "  POST /predict"
+    )
+
+    print(
+        "  POST /explain"
+    )
+
+    print(
+        "  POST /explain-gradcam"
+    )
+
+    print("=" * 50)

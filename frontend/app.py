@@ -1,587 +1,1657 @@
-import base64
-import io
 import os
-
 import requests
 import streamlit as st
-from PIL import Image
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-API_URL = os.getenv(
-    "API_URL",
-    "http://127.0.0.1:8000"
-)
+DEFAULT_API_URL = "https://kidneyvision-mlops.onrender.com"
+API_URL = os.getenv("API_URL", DEFAULT_API_URL).rstrip("/")
 
-PREDICT_ENDPOINT = f"{API_URL}/predict"
-EXPLAIN_ENDPOINT = f"{API_URL}/explain"
-HEALTH_ENDPOINT = f"{API_URL}/health"
-
-
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
+CLASS_NAMES = ["Normal", "Cyst", "Stone", "Tumor"]
 
 st.set_page_config(
-    page_title="KidneyVision MLOps",
+    page_title="KidneyVision AI",
     page_icon="🩺",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 
 # ============================================================
-# CUSTOM CSS
+# GLOBAL CSS
 # ============================================================
 
 st.markdown(
     """
-    <style>
+<style>
 
-    .main-title {
-        font-size: 42px;
-        font-weight: 700;
-        margin-bottom: 5px;
+html, body, [class*="css"] {
+    font-family:
+        Inter,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+}
+
+.stApp {
+    background:
+        radial-gradient(
+            circle at 8% 0%,
+            rgba(30, 136, 229, 0.16),
+            transparent 26%
+        ),
+        radial-gradient(
+            circle at 92% 8%,
+            rgba(0, 188, 212, 0.12),
+            transparent 25%
+        ),
+        linear-gradient(
+            135deg,
+            #f5f9ff 0%,
+            #eef5fc 50%,
+            #f8fbff 100%
+        );
+}
+
+.main .block-container {
+    max-width: 1380px;
+    padding-top: 1.5rem;
+    padding-bottom: 4rem;
+}
+
+/* Hide Streamlit chrome */
+
+#MainMenu {
+    visibility: hidden;
+}
+
+footer {
+    visibility: hidden;
+}
+
+header {
+    background: transparent !important;
+}
+
+/* Sidebar */
+
+section[data-testid="stSidebar"] {
+    background:
+        linear-gradient(
+            180deg,
+            #071b35 0%,
+            #0b2850 48%,
+            #0d3564 100%
+        );
+}
+
+section[data-testid="stSidebar"] > div {
+    background: transparent;
+}
+
+section[data-testid="stSidebar"] * {
+    color: white;
+}
+
+/* File uploader */
+
+[data-testid="stFileUploader"] {
+    background: transparent;
+}
+
+[data-testid="stFileUploaderDropzone"] {
+    background:
+        linear-gradient(
+            135deg,
+            rgba(255,255,255,0.98),
+            rgba(247,251,255,0.98)
+        ) !important;
+
+    border: 2px dashed #8eb6dc !important;
+    border-radius: 20px !important;
+    min-height: 190px !important;
+
+    transition: all 0.2s ease;
+}
+
+[data-testid="stFileUploaderDropzone"]:hover {
+    border-color: #1677c8 !important;
+    box-shadow:
+        0 12px 30px rgba(20,80,140,0.10);
+}
+
+/* Buttons */
+
+.stButton > button {
+    border: none !important;
+    border-radius: 13px !important;
+
+    background:
+        linear-gradient(
+            135deg,
+            #0d4f91,
+            #1688d5
+        ) !important;
+
+    color: white !important;
+
+    font-weight: 800 !important;
+    font-size: 0.95rem !important;
+
+    min-height: 48px;
+
+    box-shadow:
+        0 10px 25px rgba(13,79,145,0.20);
+
+    transition:
+        transform 0.18s ease,
+        box-shadow 0.18s ease;
+}
+
+.stButton > button:hover {
+    transform: translateY(-2px);
+
+    box-shadow:
+        0 14px 32px rgba(13,79,145,0.28);
+}
+
+/* Progress */
+
+.stProgress > div > div > div {
+    background:
+        linear-gradient(
+            90deg,
+            #1769aa,
+            #12a6e8
+        );
+}
+
+/* Image */
+
+[data-testid="stImage"] img {
+    border-radius: 18px;
+}
+
+/* Alerts */
+
+div[data-testid="stAlert"] {
+    border-radius: 14px;
+}
+
+/* Mobile */
+
+@media (max-width: 900px) {
+
+    .main .block-container {
+        padding-left: 1rem;
+        padding-right: 1rem;
     }
 
-    .subtitle {
-        font-size: 18px;
-        color: #666;
-        margin-bottom: 25px;
-    }
+}
 
-    .prediction-box {
-        padding: 20px;
-        border-radius: 12px;
-        border: 1px solid #ddd;
-        margin-top: 15px;
-    }
-
-    .prediction-label {
-        font-size: 16px;
-        color: #666;
-    }
-
-    .prediction-value {
-        font-size: 32px;
-        font-weight: 700;
-    }
-
-    .confidence-value {
-        font-size: 26px;
-        font-weight: 600;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# HEADER
+# HTML HELPER
 # ============================================================
 
-st.markdown(
-    '<div class="main-title">🩺 KidneyVision MLOps</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
+def render_html(content: str):
     """
-    <div class="subtitle">
-        Kidney CT Image Classification using Swin Transformer
-        with MLflow and Grad-CAM Explainability
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    Uses Streamlit's native HTML renderer.
+
+    This prevents custom HTML from appearing as raw text/code.
+    """
+    st.html(content)
+
+
+# ============================================================
+# API FUNCTIONS
+# ============================================================
+
+def check_api():
+    try:
+        response = requests.get(
+            f"{API_URL}/health",
+            timeout=10,
+        )
+
+        return response.ok
+
+    except Exception:
+        return False
+
+
+def predict_image(uploaded_file):
+
+    try:
+
+        files = {
+            "file": (
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+                uploaded_file.type or "image/jpeg",
+            )
+        }
+
+        response = requests.post(
+            f"{API_URL}/predict",
+            files=files,
+            timeout=90,
+        )
+
+        if response.ok:
+            return response.json()
+
+        return None
+
+    except Exception:
+        return None
+
+
+def explain_image(uploaded_file):
+
+    try:
+
+        files = {
+            "file": (
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+                uploaded_file.type or "image/jpeg",
+            )
+        }
+
+        response = requests.post(
+            f"{API_URL}/explain",
+            files=files,
+            timeout=150,
+        )
+
+        if response.ok:
+            return response.content
+
+        return None
+
+    except Exception:
+        return None
+
+def explain_gradcam_image(uploaded_file):
+
+    try:
+        files = {
+            "file": (
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+                uploaded_file.type or "image/jpeg",
+            )
+        }
+
+        response = requests.post(
+            f"{API_URL}/explain-gradcam",
+            files=files,
+            timeout=180,
+        )
+
+        if response.ok:
+            return response.content
+
+        return None
+
+    except Exception:
+        return None
+
+
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
+api_online = check_api()
+
 with st.sidebar:
 
-    st.header("About the Model")
-
-    st.write(
+    render_html(
         """
-        This application uses a trained Swin Transformer
-        model to classify kidney CT images into four classes.
+        <div style="
+            padding:10px 4px 24px 4px;
+            border-bottom:1px solid rgba(255,255,255,0.14);
+            margin-bottom:22px;
+        ">
+
+            <div style="
+                font-size:2.2rem;
+                margin-bottom:7px;
+            ">
+                🩺
+            </div>
+
+            <div style="
+                font-size:1.35rem;
+                font-weight:850;
+                letter-spacing:-0.4px;
+            ">
+                KidneyVision AI
+            </div>
+
+            <div style="
+                color:#b9cbe1;
+                font-size:0.78rem;
+                margin-top:5px;
+            ">
+                Deep Learning + MLOps Platform
+            </div>
+
+        </div>
         """
     )
 
-    st.markdown("### Classes")
+    # System status
 
-    st.write("🟢 Normal")
-    st.write("🔵 Cyst")
-    st.write("🟡 Stone")
-    st.write("🔴 Tumor")
+    status_color = "#62e6a4" if api_online else "#ff8585"
+    status_text = "ONLINE" if api_online else "OFFLINE"
 
-    st.markdown("---")
+    render_html(
+        f"""
+        <div style="
+            background:rgba(255,255,255,0.075);
+            border:1px solid rgba(255,255,255,0.11);
+            border-radius:16px;
+            padding:16px;
+            margin-bottom:14px;
+        ">
 
-    st.markdown("### Backend")
+            <div style="
+                color:#8faac7;
+                font-size:0.68rem;
+                font-weight:800;
+                letter-spacing:1px;
+                text-transform:uppercase;
+            ">
+                System Status
+            </div>
 
-    try:
+            <div style="
+                color:{status_color};
+                font-size:0.92rem;
+                font-weight:800;
+                margin-top:7px;
+            ">
+                ● API {status_text}
+            </div>
 
-        health_response = requests.get(
-            HEALTH_ENDPOINT,
-            timeout=5
-        )
+        </div>
+        """
+    )
 
-        if health_response.status_code == 200:
-            st.success("API Online")
-        else:
-            st.error("API Error")
+    # Model
 
-    except requests.exceptions.RequestException:
-        st.error("API Offline")
+    render_html(
+        """
+        <div style="
+            background:rgba(255,255,255,0.075);
+            border:1px solid rgba(255,255,255,0.11);
+            border-radius:16px;
+            padding:16px;
+            margin-bottom:14px;
+        ">
 
-    st.markdown("---")
+            <div style="
+                color:#8faac7;
+                font-size:0.68rem;
+                font-weight:800;
+                letter-spacing:1px;
+                text-transform:uppercase;
+            ">
+                Model
+            </div>
 
-    st.caption(
-        "KidneyVision MLOps Project"
+            <div style="
+                color:white;
+                font-size:0.95rem;
+                font-weight:800;
+                margin-top:7px;
+            ">
+                EfficientNet-B0
+            </div>
+
+        </div>
+        """
+    )
+
+    # Task
+
+    render_html(
+        """
+        <div style="
+            background:rgba(255,255,255,0.075);
+            border:1px solid rgba(255,255,255,0.11);
+            border-radius:16px;
+            padding:16px;
+            margin-bottom:14px;
+        ">
+
+            <div style="
+                color:#8faac7;
+                font-size:0.68rem;
+                font-weight:800;
+                letter-spacing:1px;
+                text-transform:uppercase;
+            ">
+                Task
+            </div>
+
+            <div style="
+                color:white;
+                font-size:0.91rem;
+                font-weight:750;
+                margin-top:7px;
+                line-height:1.4;
+            ">
+                4-Class Kidney CT Classification
+            </div>
+
+        </div>
+        """
+    )
+
+    # Classes
+
+    render_html(
+        """
+        <div style="
+            background:rgba(255,255,255,0.075);
+            border:1px solid rgba(255,255,255,0.11);
+            border-radius:16px;
+            padding:16px;
+            margin-bottom:14px;
+        ">
+
+            <div style="
+                color:#8faac7;
+                font-size:0.68rem;
+                font-weight:800;
+                letter-spacing:1px;
+                text-transform:uppercase;
+            ">
+                Classes
+            </div>
+
+            <div style="
+                color:white;
+                font-size:0.88rem;
+                font-weight:700;
+                margin-top:7px;
+                line-height:1.6;
+            ">
+                Normal · Cyst · Stone · Tumor
+            </div>
+
+        </div>
+        """
+    )
+
+    # Explainability
+
+    render_html(
+        """
+        <div style="
+            background:rgba(255,255,255,0.075);
+            border:1px solid rgba(255,255,255,0.11);
+            border-radius:16px;
+            padding:16px;
+        ">
+
+            <div style="
+                color:#8faac7;
+                font-size:0.68rem;
+                font-weight:800;
+                letter-spacing:1px;
+                text-transform:uppercase;
+            ">
+                Explainability
+            </div>
+
+            <div style="
+                color:white;
+                font-size:0.9rem;
+                font-weight:750;
+                margin-top:7px;
+            ">
+                Occlusion + Grad-CAM
+            </div>
+
+        </div>
+        """
     )
 
 
 # ============================================================
-# IMAGE UPLOAD
+# TOP HEADER
 # ============================================================
 
-st.header("Upload Kidney CT Image")
+render_html(
+    f"""
+    <div style="
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:20px;
 
-uploaded_file = st.file_uploader(
-    "Choose a CT image",
-    type=["jpg", "jpeg", "png"],
-    help="Upload a JPG or PNG kidney CT image."
+        background:rgba(255,255,255,0.82);
+        border:1px solid #dbe7f3;
+        border-radius:18px;
+
+        padding:14px 20px;
+        margin-bottom:20px;
+
+        box-shadow:
+            0 8px 28px rgba(20,50,90,0.07);
+    ">
+
+        <div style="
+            display:flex;
+            align-items:center;
+            gap:12px;
+        ">
+
+            <div style="
+                width:44px;
+                height:44px;
+
+                display:flex;
+                align-items:center;
+                justify-content:center;
+
+                border-radius:13px;
+
+                background:
+                    linear-gradient(
+                        135deg,
+                        #0d3f77,
+                        #1687d2
+                    );
+
+                color:white;
+                font-size:1.45rem;
+
+                box-shadow:
+                    0 8px 18px rgba(13,63,119,0.18);
+            ">
+                🩺
+            </div>
+
+            <div>
+
+                <div style="
+                    color:#0b2443;
+                    font-size:1.05rem;
+                    font-weight:850;
+                ">
+                    KidneyVision AI
+                </div>
+
+                <div style="
+                    color:#71849a;
+                    font-size:0.72rem;
+                    margin-top:2px;
+                ">
+                    Intelligent Kidney CT Analysis Platform
+                </div>
+
+            </div>
+
+        </div>
+
+        <div style="
+            display:flex;
+            align-items:center;
+            gap:8px;
+
+            background:
+                {'#e9fff4' if api_online else '#fff0f0'};
+
+            color:
+                {'#138653' if api_online else '#c03939'};
+
+            border:1px solid
+                {'#b9efd5' if api_online else '#ffd0d0'};
+
+            border-radius:999px;
+
+            padding:8px 13px;
+
+            font-size:0.72rem;
+            font-weight:850;
+            letter-spacing:0.5px;
+        ">
+
+            <span style="
+                width:8px;
+                height:8px;
+                border-radius:50%;
+                background:
+                    {'#20bd72' if api_online else '#e55353'};
+                display:inline-block;
+            "></span>
+
+            {'LIVE API' if api_online else 'API OFFLINE'}
+
+        </div>
+
+    </div>
+    """
 )
 
 
 # ============================================================
-# MAIN PROCESSING
+# HERO
 # ============================================================
+
+render_html(
+    """
+    <div style="
+        position:relative;
+        overflow:hidden;
+
+        background:
+            linear-gradient(
+                135deg,
+                #071c37 0%,
+                #0d3c70 52%,
+                #087dbd 100%
+            );
+
+        border-radius:26px;
+
+        padding:46px 48px;
+
+        margin-bottom:28px;
+
+        box-shadow:
+            0 22px 55px rgba(10,48,88,0.20);
+    ">
+
+        <div style="
+            position:absolute;
+            width:320px;
+            height:320px;
+            right:-120px;
+            top:-150px;
+            border-radius:50%;
+            background:rgba(255,255,255,0.08);
+        "></div>
+
+        <div style="
+            position:absolute;
+            width:180px;
+            height:180px;
+            right:120px;
+            bottom:-120px;
+            border-radius:50%;
+            background:rgba(0,210,255,0.08);
+        "></div>
+
+        <div style="
+            position:relative;
+            z-index:2;
+        ">
+
+            <div style="
+                display:inline-block;
+
+                background:rgba(255,255,255,0.10);
+
+                border:1px solid rgba(255,255,255,0.18);
+
+                border-radius:999px;
+
+                padding:8px 14px;
+
+                color:#dff3ff;
+
+                font-size:0.73rem;
+
+                font-weight:850;
+
+                letter-spacing:0.7px;
+            ">
+                🧠 AI-POWERED MEDICAL IMAGE ANALYSIS
+            </div>
+
+            <div style="
+                color:white;
+
+                font-size:3rem;
+
+                line-height:1.05;
+
+                font-weight:900;
+
+                letter-spacing:-1.8px;
+
+                margin-top:17px;
+            ">
+                KidneyVision AI
+            </div>
+
+            <div style="
+                max-width:760px;
+
+                color:#d6e9fa;
+
+                font-size:1rem;
+
+                line-height:1.7;
+
+                margin-top:15px;
+            ">
+                An end-to-end deep learning and MLOps platform
+                for classifying kidney CT images into
+                <b style="color:white;">Normal</b>,
+                <b style="color:white;">Cyst</b>,
+                <b style="color:white;">Stone</b>,
+                and <b style="color:white;">Tumor</b>
+                categories.
+            </div>
+
+            <div style="
+                display:flex;
+                flex-wrap:wrap;
+                gap:9px;
+
+                margin-top:22px;
+            ">
+
+                <span style="
+                    background:rgba(255,255,255,0.10);
+                    border:1px solid rgba(255,255,255,0.13);
+                    border-radius:999px;
+                    padding:7px 11px;
+                    color:#e4f4ff;
+                    font-size:0.72rem;
+                    font-weight:700;
+                ">
+                    PyTorch
+                </span>
+
+                <span style="
+                    background:rgba(255,255,255,0.10);
+                    border:1px solid rgba(255,255,255,0.13);
+                    border-radius:999px;
+                    padding:7px 11px;
+                    color:#e4f4ff;
+                    font-size:0.72rem;
+                    font-weight:700;
+                ">
+                    EfficientNet-B0
+                </span>
+
+                <span style="
+                    background:rgba(255,255,255,0.10);
+                    border:1px solid rgba(255,255,255,0.13);
+                    border-radius:999px;
+                    padding:7px 11px;
+                    color:#e4f4ff;
+                    font-size:0.72rem;
+                    font-weight:700;
+                ">
+                    MLflow
+                </span>
+
+                <span style="
+                    background:rgba(255,255,255,0.10);
+                    border:1px solid rgba(255,255,255,0.13);
+                    border-radius:999px;
+                    padding:7px 11px;
+                    color:#e4f4ff;
+                    font-size:0.72rem;
+                    font-weight:700;
+                ">
+                    FastAPI
+                </span>
+
+                <span style="
+                    background:rgba(255,255,255,0.10);
+                    border:1px solid rgba(255,255,255,0.13);
+                    border-radius:999px;
+                    padding:7px 11px;
+                    color:#e4f4ff;
+                    font-size:0.72rem;
+                    font-weight:700;
+                ">
+                    Docker
+                </span>
+
+                <span style="
+                    background:rgba(255,255,255,0.10);
+                    border:1px solid rgba(255,255,255,0.13);
+                    border-radius:999px;
+                    padding:7px 11px;
+                    color:#e4f4ff;
+                    font-size:0.72rem;
+                    font-weight:700;
+                ">
+                    Explainable AI
+                </span>
+
+            </div>
+
+        </div>
+
+    </div>
+    """
+)
+
+
+# ============================================================
+# UPLOAD SECTION
+# ============================================================
+
+render_html(
+    """
+    <div style="
+        margin-top:5px;
+        margin-bottom:7px;
+
+        color:#0b2748;
+
+        font-size:1.45rem;
+
+        font-weight:900;
+    ">
+        🔬 Analyze Kidney CT Scan
+    </div>
+
+    <div style="
+        color:#6b7f95;
+        font-size:0.88rem;
+        margin-bottom:16px;
+    ">
+        Upload a CT image and run the deployed AI model.
+    </div>
+    """
+)
+
+
+# ============================================================
+# UPLOAD CARD
+# ============================================================
+
+render_html(
+    """
+    <div style="
+        background:rgba(255,255,255,0.88);
+
+        border:1px solid #d9e6f3;
+
+        border-radius:22px;
+
+        padding:20px;
+
+        box-shadow:
+            0 10px 30px rgba(20,50,90,0.07);
+
+        margin-bottom:18px;
+    ">
+    """
+)
+
+uploaded_file = st.file_uploader(
+    "Upload kidney CT image",
+    type=["jpg", "jpeg", "png"],
+    label_visibility="visible",
+)
+
+render_html(
+    """
+    <div style="
+        text-align:center;
+
+        color:#71849a;
+
+        font-size:0.78rem;
+
+        margin-top:8px;
+    ">
+        Supported formats: JPG · JPEG · PNG
+        &nbsp;&nbsp;•&nbsp;&nbsp;
+        Medical/research prototype
+    </div>
+
+    </div>
+    """
+)
+
+
+# ============================================================
+# PREVIEW
+# ============================================================
+
+analyze = False
 
 if uploaded_file is not None:
 
-    image_bytes = uploaded_file.getvalue()
+    st.write("")
 
-    try:
+    preview_col, action_col = st.columns(
+        [1.45, 1],
+        gap="large",
+    )
 
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        ).convert("RGB")
+    with preview_col:
 
-    except Exception:
+        render_html(
+            """
+            <div style="
+                color:#0b2748;
+                font-size:0.82rem;
+                font-weight:850;
+                text-transform:uppercase;
+                letter-spacing:0.8px;
+                margin-bottom:8px;
+            ">
+                Uploaded Scan
+            </div>
+            """
+        )
+
+        st.image(
+            uploaded_file,
+            caption=uploaded_file.name,
+            width="stretch",
+        )
+
+    with action_col:
+
+        render_html(
+            """
+            <div style="
+                background:
+                    linear-gradient(
+                        135deg,
+                        #f2f8ff,
+                        #ffffff
+                    );
+
+                border:1px solid #dbe8f4;
+
+                border-radius:18px;
+
+                padding:22px;
+
+                margin-top:25px;
+            ">
+
+                <div style="
+                    font-size:2rem;
+                    margin-bottom:10px;
+                ">
+                    🧠
+                </div>
+
+                <div style="
+                    color:#0b2748;
+                    font-size:1.1rem;
+                    font-weight:850;
+                ">
+                    Ready for AI Analysis
+                </div>
+
+                <div style="
+                    color:#71849a;
+                    font-size:0.82rem;
+                    line-height:1.6;
+                    margin-top:8px;
+                ">
+                    The deployed EfficientNet-B0 model
+                    will classify the scan into four categories.
+                </div>
+
+            </div>
+            """
+        )
+
+        st.write("")
+
+        analyze = st.button(
+            "🔍  Analyze CT Scan",
+            use_container_width=True,
+        )
+
+
+# ============================================================
+# ANALYSIS
+# ============================================================
+
+if uploaded_file is not None and analyze:
+
+    if not api_online:
 
         st.error(
-            "The uploaded file is not a valid image."
+            "Prediction API is currently unavailable. "
+            "Please check the Render backend."
         )
 
         st.stop()
 
+    # --------------------------------------------------------
+    # PREDICTION
+    # --------------------------------------------------------
 
-    # ========================================================
-    # DISPLAY UPLOADED IMAGE
-    # ========================================================
+    with st.spinner(
+        "🧠 Running EfficientNet-B0 inference..."
+    ):
 
-    st.markdown("### Uploaded Image")
+        prediction_result = predict_image(uploaded_file)
 
-    col1, col2 = st.columns(2)
+    if prediction_result is None:
 
-    with col1:
-
-        st.image(
-            image,
-            caption=uploaded_file.name,
-            width="stretch"
+        st.error(
+            "Prediction failed. Please try another image."
         )
 
-    with col2:
+        st.stop()
 
-        st.info(
+    prediction = prediction_result.get(
+        "prediction",
+        "Unknown",
+    )
+
+    confidence = float(
+        prediction_result.get(
+            "confidence",
+            0,
+        )
+    )
+
+    confidence_percent = float(
+        prediction_result.get(
+            "confidence_percent",
+            confidence * 100,
+        )
+    )
+
+    probabilities = prediction_result.get(
+        "probabilities",
+        {},
+    )
+
+    # --------------------------------------------------------
+    # RESULT HEADER
+    # --------------------------------------------------------
+
+    render_html(
+        """
+        <div style="
+            margin-top:34px;
+            margin-bottom:7px;
+
+            color:#0b2748;
+
+            font-size:1.45rem;
+
+            font-weight:900;
+        ">
+            📊 Analysis Result
+        </div>
+
+        <div style="
+            color:#6b7f95;
+            font-size:0.88rem;
+            margin-bottom:18px;
+        ">
+            Output returned by the deployed AI inference service.
+        </div>
+        """
+    )
+
+    # --------------------------------------------------------
+    # RESULT CARDS
+    # --------------------------------------------------------
+
+    result_col, confidence_col = st.columns(
+        2,
+        gap="large",
+    )
+
+    with result_col:
+
+        render_html(
             f"""
-            **Filename:** {uploaded_file.name}
+            <div style="
+                background:white;
 
-            **Image size:** {image.size[0]} × {image.size[1]}
+                border:1px solid #dbe7f3;
 
-            **Format:** {uploaded_file.type}
+                border-radius:20px;
 
-            **Mode:** {image.mode}
+                padding:25px;
+
+                min-height:150px;
+
+                box-shadow:
+                    0 10px 28px rgba(20,50,90,0.07);
+            ">
+
+                <div style="
+                    color:#74869b;
+
+                    font-size:0.68rem;
+
+                    text-transform:uppercase;
+
+                    letter-spacing:1px;
+
+                    font-weight:850;
+                ">
+                    Predicted Class
+                </div>
+
+                <div style="
+                    color:#0b2748;
+
+                    font-size:2.35rem;
+
+                    font-weight:900;
+
+                    margin-top:9px;
+
+                    letter-spacing:-1px;
+                ">
+                    {prediction}
+                </div>
+
+                <div style="
+                    color:#7b8da2;
+
+                    font-size:0.78rem;
+
+                    margin-top:7px;
+                ">
+                    Highest probability class from the model.
+                </div>
+
+            </div>
             """
         )
 
-    st.markdown("---")
+    with confidence_col:
 
+        render_html(
+            f"""
+            <div style="
+                background:white;
 
-    # ========================================================
-    # ANALYZE BUTTON
-    # ========================================================
+                border:1px solid #dbe7f3;
 
-    if st.button(
-        "🔍 Analyze Image",
-        type="primary",
-        width="stretch"
-    ):
+                border-radius:20px;
 
-        with st.spinner(
-            "Running Swin Transformer inference and generating Grad-CAM..."
-        ):
+                padding:25px;
 
-            try:
+                min-height:150px;
 
-                # ------------------------------------------------
-                # PREPARE IMAGE FILE
-                # ------------------------------------------------
+                box-shadow:
+                    0 10px 28px rgba(20,50,90,0.07);
+            ">
 
-                files = {
-                    "file": (
-                        uploaded_file.name,
-                        image_bytes,
-                        uploaded_file.type
-                    )
-                }
+                <div style="
+                    color:#74869b;
 
+                    font-size:0.68rem;
 
-                # =================================================
-                # STEP 1: PREDICTION
-                # =================================================
+                    text-transform:uppercase;
 
-                predict_response = requests.post(
-                    PREDICT_ENDPOINT,
-                    files=files,
-                    timeout=120
-                )
+                    letter-spacing:1px;
 
+                    font-weight:850;
+                ">
+                    Model Confidence
+                </div>
 
-                # ------------------------------------------------
-                # HANDLE PREDICTION API ERROR
-                # ------------------------------------------------
+                <div style="
+                    color:#0877bd;
 
-                if predict_response.status_code != 200:
+                    font-size:2.35rem;
 
-                    try:
+                    font-weight:900;
 
-                        error_detail = predict_response.json()
+                    margin-top:9px;
 
-                    except Exception:
+                    letter-spacing:-1px;
+                ">
+                    {confidence_percent:.2f}%
+                </div>
 
-                        error_detail = predict_response.text
+                <div style="
+                    color:#7b8da2;
 
-                    st.error(
-                        f"Prediction API request failed "
-                        f"(HTTP {predict_response.status_code})"
-                    )
+                    font-size:0.78rem;
 
-                    st.code(
-                        str(error_detail)
-                    )
+                    margin-top:7px;
+                ">
+                    Softmax probability for the predicted class.
+                </div>
 
-                    st.stop()
+            </div>
+            """
+        )
 
+    # --------------------------------------------------------
+    # MODEL INFORMATION
+    # --------------------------------------------------------
 
-                # ------------------------------------------------
-                # READ PREDICTION JSON
-                # ------------------------------------------------
+    st.write("")
 
-                result = predict_response.json()
-
-                prediction = result.get(
-                    "prediction",
-                    "Unknown"
-                )
-
-                confidence = float(
-                    result.get(
-                        "confidence",
-                        0
-                    )
-                )
-
-                confidence_percent = float(
-                    result.get(
-                        "confidence_percent",
-                        confidence * 100
-                    )
-                )
-
-                probabilities = result.get(
-                    "probabilities",
-                    {}
-                )
-
-
-                # =================================================
-                # STEP 2: GRAD-CAM
-                # =================================================
-
-                explain_response = requests.post(
-                    EXPLAIN_ENDPOINT,
-                    files=files,
-                    timeout=120
-                )
-
-
-                # ------------------------------------------------
-                # HANDLE GRAD-CAM RESPONSE
-                # ------------------------------------------------
-
-                if explain_response.status_code == 200:
-
-                    gradcam_base64 = base64.b64encode(
-                        explain_response.content
-                    ).decode("utf-8")
-
-                else:
-
-                    gradcam_base64 = None
-
-                    st.warning(
-                        "Prediction succeeded, but "
-                        "Grad-CAM could not be generated."
-                    )
-
-
-                # =================================================
-                # SAVE RESULT
-                # =================================================
-
-                result["gradcam_image_base64"] = (
-                    gradcam_base64
-                )
-
-                st.session_state["result"] = result
-
-
-                # =================================================
-                # PREDICTION RESULT
-                # =================================================
-
-                st.markdown("---")
-
-                st.header("Prediction Result")
-
-                result_col1, result_col2 = st.columns(2)
-
-
-                # ------------------------------------------------
-                # PREDICTED CLASS
-                # ------------------------------------------------
-
-                with result_col1:
-
-                    st.html(
-                        f"""
-                        <div class="prediction-box">
-                            <div class="prediction-label">
-                                Predicted Class
-                            </div>
-
-                            <div class="prediction-value">
-                                {prediction}
-                            </div>
-                        </div>
-                        """
-                    )
-
-
-                # ------------------------------------------------
-                # CONFIDENCE
-                # ------------------------------------------------
-
-                with result_col2:
-
-                    st.html(
-                        f"""
-                        <div class="prediction-box">
-                            <div class="prediction-label">
-                                Confidence
-                            </div>
-
-                            <div class="confidence-value">
-                                {confidence_percent:.2f}%
-                            </div>
-                        </div>
-                        """
-                    )
-
-
-                # =================================================
-                # CLASS PROBABILITIES
-                # =================================================
-
-                st.markdown("### Class Probabilities")
-
-                if probabilities:
-
-                    probability_columns = st.columns(
-                        len(probabilities)
-                    )
-
-                    for column, (
-                        class_name,
-                        probability
-                    ) in zip(
-                        probability_columns,
-                        probabilities.items()
-                    ):
-
-                        probability = float(
-                            probability
-                        )
-
-                        probability_percent = (
-                            probability * 100
-                        )
-
-                        with column:
-
-                            st.metric(
-                                label=class_name,
-                                value=(
-                                    f"{probability_percent:.2f}%"
-                                )
-                            )
-
-                            st.progress(
-                                min(
-                                    max(
-                                        probability,
-                                        0.0
-                                    ),
-                                    1.0
-                                )
-                            )
-
-
-                # =================================================
-                # GRAD-CAM EXPLAINABILITY
-                # =================================================
-
-                st.markdown("---")
-
-                st.header(
-                    "Grad-CAM Explainability"
-                )
-
-                st.write(
-                    """
-                    Grad-CAM highlights image regions that
-                    contributed to the model's prediction.
-                    """
-                )
-
-
-                if gradcam_base64:
-
-                    try:
-
-                        gradcam_bytes = base64.b64decode(
-                            gradcam_base64
-                        )
-
-                        gradcam_image = Image.open(
-                            io.BytesIO(
-                                gradcam_bytes
-                            )
-                        )
-
-                        st.image(
-                            gradcam_image,
-                            caption="Grad-CAM Explanation",
-                            width="stretch"
-                        )
-
-                    except Exception as error:
-
-                        st.error(
-                            "Could not decode Grad-CAM image."
-                        )
-
-                        st.exception(error)
-
-                else:
-
-                    st.warning(
-                        "Grad-CAM image was not returned by the API."
-                    )
-
-
-            # ====================================================
-            # REQUEST ERROR HANDLING
-            # ====================================================
-
-            except requests.exceptions.Timeout:
-
-                st.error(
-                    """
-                    The API request timed out.
-
-                    Make sure the FastAPI server is running
-                    and the model is loaded.
-                    """
-                )
-
-
-            except requests.exceptions.ConnectionError:
-
-                st.error(
-                    f"""
-                    Could not connect to FastAPI.
-
-                    Current API URL:
-
-                    {API_URL}
-                    """
-                )
-
-
-            except requests.exceptions.RequestException as error:
-
-                st.error(
-                    f"Request failed: {error}"
-                )
-
-
-            except Exception as error:
-
-                st.error(
-                    "An unexpected error occurred."
-                )
-
-                st.exception(error)
-
-
-# ============================================================
-# INITIAL SCREEN
-# ============================================================
-
-else:
-
-    st.info(
+    render_html(
         """
-        Upload a kidney CT image above to start classification.
-
-        The application will return:
-
-        • Predicted kidney condition
-        • Prediction confidence
-        • Probability for each class
-        • Grad-CAM visual explanation
+        <div style="
+            color:#0b2748;
+            font-size:1.05rem;
+            font-weight:850;
+            margin-top:15px;
+            margin-bottom:12px;
+        ">
+            ⚙️ Model Information
+        </div>
         """
     )
+
+    info1, info2, info3, info4 = st.columns(4)
+
+    info_data = [
+        (
+            info1,
+            "🧠",
+            "Architecture",
+            "EfficientNet-B0",
+        ),
+        (
+            info2,
+            "🖼️",
+            "Input Size",
+            "224 × 224 RGB",
+        ),
+        (
+            info3,
+            "🎯",
+            "Classes",
+            "4 Categories",
+        ),
+        (
+            info4,
+            "🔎",
+            "Explainability",
+            "Occlusion + Grad-CAM",
+        ),
+    ]
+
+    for column, icon, label, value in info_data:
+
+        with column:
+
+            render_html(
+                f"""
+                <div style="
+                    background:white;
+
+                    border:1px solid #dbe7f3;
+
+                    border-radius:16px;
+
+                    padding:18px;
+
+                    min-height:105px;
+
+                    box-shadow:
+                        0 7px 20px rgba(20,50,90,0.05);
+                ">
+
+                    <div style="
+                        font-size:1.25rem;
+                    ">
+                        {icon}
+                    </div>
+
+                    <div style="
+                        color:#71849a;
+
+                        font-size:0.67rem;
+
+                        text-transform:uppercase;
+
+                        letter-spacing:0.7px;
+
+                        font-weight:800;
+
+                        margin-top:7px;
+                    ">
+                        {label}
+                    </div>
+
+                    <div style="
+                        color:#0b2748;
+
+                        font-size:0.91rem;
+
+                        font-weight:850;
+
+                        margin-top:4px;
+                    ">
+                        {value}
+                    </div>
+
+                </div>
+                """
+            )
+
+    # --------------------------------------------------------
+    # PROBABILITY DISTRIBUTION
+    # --------------------------------------------------------
+
+    st.write("")
+
+    render_html(
+        """
+        <div style="
+            color:#0b2748;
+            font-size:1.25rem;
+            font-weight:900;
+            margin-top:25px;
+        ">
+            📈 Class Probability Distribution
+        </div>
+
+        <div style="
+            color:#6b7f95;
+            font-size:0.84rem;
+            margin-top:4px;
+            margin-bottom:15px;
+        ">
+            Relative probabilities generated by the neural network.
+        </div>
+        """
+    )
+
+    probability_icons = {
+        "Normal": "🟢",
+        "Cyst": "🟡",
+        "Stone": "🟠",
+        "Tumor": "🔴",
+    }
+
+    for class_name in CLASS_NAMES:
+
+        value = float(
+            probabilities.get(
+                class_name,
+                0,
+            )
+        )
+
+        percentage = value * 100
+
+        left, right = st.columns(
+            [5, 1],
+            gap="small",
+        )
+
+        with left:
+
+            render_html(
+                f"""
+                <div style="
+                    color:#263c55;
+
+                    font-size:0.88rem;
+
+                    font-weight:800;
+
+                    margin-top:8px;
+                ">
+                    {probability_icons[class_name]}
+                    &nbsp;&nbsp;
+                    {class_name}
+                </div>
+                """
+            )
+
+        with right:
+
+            render_html(
+                f"""
+                <div style="
+                    text-align:right;
+
+                    color:#0b2748;
+
+                    font-size:0.88rem;
+
+                    font-weight:900;
+
+                    margin-top:8px;
+                ">
+                    {percentage:.2f}%
+                </div>
+                """
+            )
+
+        st.progress(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    value,
+                ),
+            )
+        )
+
+    # --------------------------------------------------------
+    # EXPLAINABILITY
+    # --------------------------------------------------------
+
+    st.write("")
+
+    render_html(
+        """
+        <div style="
+            color:#0b2748;
+            font-size:1.25rem;
+            font-weight:900;
+            margin-top:30px;
+        ">
+            🔎 Explainable AI
+        </div>
+
+        <div style="
+            color:#6b7f95;
+            font-size:0.84rem;
+            margin-top:4px;
+            margin-bottom:15px;
+        ">
+            Visual explanations generated using occlusion sensitivity and Grad-CAM.
+        </div>
+        """
+    )
+
+    with st.spinner(
+        "🧠 Generating explainability maps..."
+    ):
+
+        explanation = explain_image(
+            uploaded_file
+        )
+
+        gradcam_explanation = explain_gradcam_image(
+            uploaded_file
+        )
+
+    # --------------------------------------------------------
+    # OCCLUSION SENSITIVITY
+    # --------------------------------------------------------
+
+    if explanation:
+
+        render_html(
+            """
+            <div style="
+                background:white;
+                border:1px solid #dbe7f3;
+                border-radius:20px;
+                padding:22px;
+                box-shadow:
+                    0 10px 28px rgba(20,50,90,0.07);
+                margin-bottom:12px;
+            ">
+
+                <div style="
+                    color:#0b2748;
+                    font-size:1rem;
+                    font-weight:850;
+                ">
+                    🧠 Occlusion Sensitivity Map
+                </div>
+
+                <div style="
+                    color:#6b7f95;
+                    font-size:0.8rem;
+                    line-height:1.6;
+                    margin-top:6px;
+                ">
+                    Highlighted regions represent areas where
+                    masking parts of the image produced a stronger
+                    change in the model's predicted probability.
+                </div>
+
+            </div>
+            """
+        )
+
+        st.image(
+            explanation,
+            width="stretch",
+        )
+
+    else:
+
+        st.warning(
+            "Prediction succeeded, but the occlusion visualization "
+            "could not be generated."
+        )
+
+    # --------------------------------------------------------
+    # GRAD-CAM
+    # --------------------------------------------------------
+
+    if gradcam_explanation:
+
+        render_html(
+            """
+            <div style="
+                background:white;
+                border:1px solid #dbe7f3;
+                border-radius:20px;
+                padding:22px;
+                box-shadow:
+                    0 10px 28px rgba(20,50,90,0.07);
+                margin-top:18px;
+                margin-bottom:12px;
+            ">
+
+                <div style="
+                    color:#0b2748;
+                    font-size:1rem;
+                    font-weight:850;
+                ">
+                    🔥 Grad-CAM Visualization
+                </div>
+
+                <div style="
+                    color:#6b7f95;
+                    font-size:0.8rem;
+                    line-height:1.6;
+                    margin-top:6px;
+                ">
+                    Gradient-based visualization showing the
+                    image regions that contributed most strongly
+                    to the model's predicted class.
+                </div>
+
+            </div>
+            """
+        )
+
+        # API returns the complete 3-panel PNG:
+        # Original CT Image | Grad-CAM | Prediction Overlay.
+        # Streamlit renders the image natively; no image HTML is used.
+        st.image(
+            gradcam_explanation,
+            width="stretch",
+        )
+
+    else:
+
+        st.warning(
+            "Grad-CAM visualization could not be generated."
+        )
+
 
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.markdown("---")
+render_html(
+    """
+    <div style="
+        margin-top:55px;
 
-st.caption(
-    "KidneyVision MLOps • Swin Transformer • FastAPI • Grad-CAM"
+        padding-top:22px;
+
+        border-top:1px solid #d9e5f0;
+
+        text-align:center;
+
+        color:#7a8da2;
+
+        font-size:0.76rem;
+
+        line-height:1.8;
+    ">
+
+        <div style="
+            color:#304b68;
+            font-weight:850;
+            font-size:0.86rem;
+        ">
+            KidneyVision AI
+        </div>
+
+        <div>
+            Deep Learning · MLOps · Explainable AI
+        </div>
+
+        <div style="
+            margin-top:8px;
+        ">
+            PyTorch · FastAPI · MLflow · Docker · Streamlit
+        </div>
+
+        <div style="
+            margin-top:12px;
+            color:#8a9aad;
+        ">
+            ⚠️ Academic/research prototype.
+            Not intended for clinical diagnosis.
+        </div>
+
+    </div>
+    """
 )
