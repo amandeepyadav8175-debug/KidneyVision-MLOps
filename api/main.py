@@ -14,7 +14,7 @@ from api.inference import (
 )
 
 from configs.training_config import CLASS_NAMES
-from src.explainability.gradcam import generate_gradcam_for_api
+from src.explainability.occlusion import generate_occlusion_for_api
 
 
 # ============================================================
@@ -223,7 +223,7 @@ async def predict(
 
 
 # ============================================================
-# GRAD-CAM EXPLANATION ENDPOINT
+# EXPLAINABILITY ENDPOINT
 # ============================================================
 
 @app.post("/explain")
@@ -261,28 +261,53 @@ async def explain(
             ) from exc
 
         # --------------------------------------------------------
-        # Generate Grad-CAM
+        # Load model
         # --------------------------------------------------------
 
-        gradcam_bytes = generate_gradcam_for_api(
-            model=get_model(),
+        model = get_model()
+
+        # --------------------------------------------------------
+        # Determine model device
+        # --------------------------------------------------------
+
+        try:
+
+            device = next(model.parameters()).device
+
+        except StopIteration as exc:
+
+            raise RuntimeError(
+                "Unable to determine model device."
+            ) from exc
+
+        # --------------------------------------------------------
+        # Generate gradient-free occlusion explanation
+        #
+        # This intentionally replaces Grad-CAM for the API
+        # because Render Free has a strict memory limit.
+        # --------------------------------------------------------
+
+        explanation_bytes = generate_occlusion_for_api(
+            model=model,
             image=image,
+            device=device,
             predicted_index=predicted_index,
             predicted_class=predicted_class,
             confidence=confidence,
         )
 
         logger.info(
-            "Grad-CAM generated for prediction: %s",
+            "Occlusion explanation generated for prediction: %s",
             predicted_class,
         )
 
         return Response(
-            content=gradcam_bytes,
+            content=explanation_bytes,
             media_type="image/png",
             headers={
                 "X-Predicted-Class": predicted_class,
                 "X-Confidence": str(confidence),
+                "X-Explainability": "occlusion-sensitivity",
             },
         )
 
@@ -292,7 +317,7 @@ async def explain(
     except Exception as exc:
 
         logger.exception(
-            "Grad-CAM generation failed."
+            "Explainability generation failed."
         )
 
         raise HTTPException(
